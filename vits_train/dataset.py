@@ -1,176 +1,346 @@
-"""Classes and methods for loading phonemes and mel spectrograms"""
-import csv
-import json
 import logging
-import random
+import tempfile
 import typing
+from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
+import librosa
 import torch
-import torch.utils.data
+from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 
-from .config import TrainingConfig
+from vits_train.config import TrainingConfig
+from vits_train.mel_processing import spectrogram_torch
 
-_LOGGER = logging.getLogger("glow_tts_train.dataset")
+_LOGGER = logging.getLogger("vits_train.dataset")
+
+
+@dataclass
+class Utterance:
+    id: str
+    phoneme_ids: typing.Sequence[int]
+    audio_path: Path
+    spec_length: int
+    speaker_id: typing.Optional[int] = None
+
+
+@dataclass
+class UtteranceTensors:
+    id: str
+    phoneme_ids: torch.LongTensor
+    spectrogram: torch.FloatTensor
+    audio_norm: torch.FloatTensor
+    spec_length: int
+    speaker_id: typing.Optional[torch.LongTensor] = None
+
+
+@dataclass
+class Batch:
+    phoneme_ids: torch.LongTensor
+    phoneme_lengths: torch.LongTensor
+    spectrograms: torch.FloatTensor
+    spectrogram_lengths: torch.LongTensor
+    audios: torch.FloatTensor
+    audio_lengths: torch.LongTensor
+    speaker_ids: typing.Optional[torch.LongTensor] = None
+
 
 # -----------------------------------------------------------------------------
 
 
-class PhonemeMelLoader(torch.utils.data.Dataset):
+class PhonemeIdsAndMelsDataset(Dataset):
     def __init__(
         self,
-        id_phonemes: typing.Dict[typing.Tuple[int, str], torch.IntTensor],
-        id_mels: typing.Dict[typing.Tuple[int, str], torch.FloatTensor],
-        mel_dirs: typing.Optional[typing.Dict[int, Path]] = None,
-        multispeaker: bool = False,
+        config: TrainingConfig,
+        utt_phoneme_ids: typing.Mapping[str, typing.Sequence[int]],
+        audio_dir: typing.Union[str, Path],
+        spec_lengths: typing.Mapping[str, int],
+        utt_speaker_ids: typing.Optional[typing.Mapping[str, int]] = None,
+        cache_dir: typing.Optional[typing.Union[str, Path]] = None,
     ):
-        self.id_phonemes = id_phonemes
-        self.id_mels = id_mels
-        self.mel_dirs = mel_dirs
-        self.multispeaker = multispeaker
+        super().__init__()
 
-        if self.id_mels:
-            self.ids = list(
-                set.intersection(set(id_phonemes.keys()), set(id_mels.keys()))
-            )
-            assert self.ids, "No shared utterance ids between phonemes and mels"
+        self.config = config
+        self.audio_dir = Path(audio_dir)
+        self.utterances: typing.List[Utterance] = []
+
+        self.temp_dir: typing.Optional[tempfile.TemporaryDirectory] = None
+
+        if cache_dir is None:
+            self.temp_dir = tempfile.TemporaryDirectory(prefix="vits_train")
+            self.cache_dir = Path(self.temp_dir.name)
         else:
-            # Assume all ids will be present in mels_dir
-            self.ids = list(id_phonemes.keys())
+            self.cache_dir = Path(cache_dir)
 
-        random.shuffle(self.ids)
+        if utt_speaker_ids is None:
+            utt_speaker_ids = {}
+
+        for utt_id, phoneme_ids in utt_phoneme_ids.items():
+            audio_path = self.audio_dir / utt_id
+            if not audio_path.is_file():
+                # Try WAV extension
+                audio_path = self.audio_dir / f"{utt_id}.wav"
+
+            if audio_path.is_file():
+                self.utterances.append(
+                    Utterance(
+                        id=utt_id,
+                        phoneme_ids=phoneme_ids,
+                        audio_path=audio_path,
+                        spec_length=spec_lengths[utt_id],
+                        speaker_id=utt_speaker_ids.get(utt_id),
+                    )
+                )
+            else:
+                _LOGGER.warning("Missing audio file: %s", audio_path)
 
     def __getitem__(self, index):
-        utt_key = self.ids[index]
-        speaker_idx, utt_id = utt_key
-        text = self.id_phonemes[utt_key]
-        mel = self.id_mels.get(utt_key)
+        utterance = self.utterances[index]
 
-        if mel is None:
-            mels_dir = self.mel_dirs.get(speaker_idx)
-            assert mels_dir, f"Missing mel for id {utt_id}, but no mels_dir"
-            mel_path = mels_dir / (utt_id + ".npy")
+        audio_norm_path = (
+            self.cache_dir / utterance.audio_path.with_suffix(".norm.pt").name
+        )
+        if audio_norm_path.is_file():
+            audio_norm = torch.load(str(audio_norm_path))
+        else:
+            # Load audio and resample
+            audio, _sample_rate = librosa.load(
+                str(utterance.audio_path), sr=self.config.audio.sample_rate
+            )
 
-            # TODO: Verify shape
-            mel = torch.from_numpy(np.load(mel_path, allow_pickle=True))
+            audio_norm = torch.FloatTensor(
+                audio / self.config.audio.max_wav_value
+            ).unsqueeze(0)
 
-            # Cache mel
-            self.id_mels[utt_key] = mel
+            torch.save(audio_norm, str(audio_norm_path))
 
-        if self.multispeaker:
-            # phonemes, mels, length, speaker
-            return (text, mel, len(text), speaker_idx)
+        spectrogram_path = (
+            self.cache_dir / utterance.audio_path.with_suffix(".spec.pt").name
+        )
+        if spectrogram_path.is_file():
+            spectrogram = torch.load(str(spectrogram_path))
+        else:
+            spectrogram = spectrogram_torch(
+                y=audio_norm,
+                n_fft=self.config.audio.filter_length,
+                sampling_rate=self.config.audio.sample_rate,
+                hop_size=self.config.audio.hop_length,
+                win_size=self.config.audio.win_length,
+                center=False,
+            ).squeeze(0)
 
-        # phonemes, mels, length
-        return (text, mel, len(text))
+            torch.save(spectrogram, str(spectrogram_path))
+
+        speaker_id = None
+        if utterance.speaker_id is not None:
+            speaker_id = torch.LongTensor([utterance.speaker_id])
+
+        return UtteranceTensors(
+            id=utterance.id,
+            phoneme_ids=torch.LongTensor(utterance.phoneme_ids),
+            audio_norm=audio_norm,
+            spectrogram=spectrogram,
+            spec_length=utterance.spec_length,
+            speaker_id=speaker_id,
+        )
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.utterances)
 
 
-class PhonemeMelCollate:
-    def __init__(self, n_frames_per_step: int = 1, multispeaker: bool = False):
-        self.n_frames_per_step = n_frames_per_step
-        self.multispeaker = multispeaker
+class UtteranceCollate:
+    def __call__(self, utterances: typing.Sequence[UtteranceTensors]) -> Batch:
+        num_utterances = len(utterances)
+        assert num_utterances > 0, "No utterances"
 
-    def __call__(self, batch):
-        # Right zero-pad all one-hot text sequences to max input length
-        input_lengths, ids_sorted_decreasing = torch.sort(
-            torch.LongTensor([len(x[0]) for x in batch]), dim=0, descending=True
+        max_phonemes_length = 0
+        max_spec_length = 0
+        max_audio_length = 0
+
+        num_mels = 0
+        multispeaker = False
+
+        # Determine lengths
+        for utt_idx, utt in enumerate(utterances):
+            assert utt.spectrogram is not None
+            assert utt.audio_norm is not None
+
+            phoneme_length = utt.phoneme_ids.size(0)
+            spec_length = utt.spectrogram.size(1)
+            audio_length = utt.audio_norm.size(1)
+
+            max_phonemes_length = max(max_phonemes_length, phoneme_length)
+            max_spec_length = max(max_spec_length, spec_length)
+            max_audio_length = max(max_audio_length, audio_length)
+
+            num_mels = utt.spectrogram.size(0)
+            if utt.speaker_id is not None:
+                multispeaker = True
+
+        # Create padded tensors
+        phonemes_padded = torch.LongTensor(num_utterances, max_phonemes_length)
+        spec_padded = torch.FloatTensor(num_utterances, num_mels, max_spec_length)
+        audio_padded = torch.FloatTensor(num_utterances, 1, max_audio_length)
+
+        phonemes_padded.zero_()
+        spec_padded.zero_()
+        audio_padded.zero_()
+
+        phoneme_lengths = torch.LongTensor(num_utterances)
+        spec_lengths = torch.LongTensor(num_utterances)
+        audio_lengths = torch.LongTensor(num_utterances)
+
+        speaker_ids: typing.Optional[torch.LongTensor] = None
+        if multispeaker:
+            speaker_ids = torch.LongTensor(num_utterances)
+
+        # Sort by decreasing spectrogram length
+        sorted_utterances = sorted(
+            utterances, key=lambda u: u.spectrogram.size(1), reverse=True
         )
-        max_input_len = input_lengths[0]
+        for utt_idx, utt in enumerate(sorted_utterances):
+            phoneme_length = utt.phoneme_ids.size(0)
+            spec_length = utt.spectrogram.size(1)
+            audio_length = utt.audio_norm.size(1)
 
-        text_padded = torch.LongTensor(len(batch), max_input_len)
-        text_padded.zero_()
-        for i in range(len(ids_sorted_decreasing)):
-            text = batch[ids_sorted_decreasing[i]][0]
-            text_padded[i, : text.size(0)] = text
+            phonemes_padded[utt_idx, :phoneme_length] = utt.phoneme_ids
+            phoneme_lengths[utt_idx] = phoneme_length
 
-        # Right zero-pad mel-spec
-        num_mels = batch[0][1].size(0)
-        max_target_len = max([x[1].size(1) for x in batch])
-        if max_target_len % self.n_frames_per_step != 0:
-            max_target_len += (
-                self.n_frames_per_step - max_target_len % self.n_frames_per_step
-            )
-            assert max_target_len % self.n_frames_per_step == 0
+            spec_padded[utt_idx, :, :spec_length] = utt.spectrogram
+            spec_lengths[utt_idx] = spec_length
 
-        # include mel padded
-        mel_padded = torch.FloatTensor(len(batch), num_mels, max_target_len)
-        mel_padded.zero_()
-        output_lengths = torch.LongTensor(len(batch))
+            audio_padded[utt_idx, :, :audio_length] = utt.audio_norm
+            audio_lengths[utt_idx] = audio_length
 
-        speaker_ids = None
-        if self.multispeaker:
-            speaker_ids = torch.LongTensor(len(batch))
+            if utt.speaker_id is not None:
+                assert speaker_ids is not None
+                speaker_ids[utt_idx] = utt.speaker_id
 
-        for i in range(len(ids_sorted_decreasing)):
-            mel = batch[ids_sorted_decreasing[i]][1]
-            mel_padded[i, :, : mel.size(1)] = mel
-            output_lengths[i] = mel.size(1)
-
-            if speaker_ids is not None:
-                speaker_ids[i] = batch[ids_sorted_decreasing[i]][3]
-
-        return text_padded, input_lengths, mel_padded, output_lengths, speaker_ids
-
-
-# -----------------------------------------------------------------------------
-
-
-def load_phonemes(
-    csv_file: typing.TextIO, config: TrainingConfig
-) -> typing.Dict[str, torch.IntTensor]:
-    phonemes = {}
-    num_too_small = 0
-    num_too_large = 0
-
-    reader = csv.reader(csv_file, delimiter="|")
-    for row in reader:
-        utt_id, phoneme_str = row[0], row[1]
-        phoneme_ids = [int(p) for p in phoneme_str.strip().split()]
-        num_phonemes = len(phoneme_ids)
-
-        if (config.min_seq_length is not None) and (
-            num_phonemes < config.min_seq_length
-        ):
-            _LOGGER.debug(
-                "Dropping %s (%s < %s)", utt_id, num_phonemes, config.min_seq_length
-            )
-            num_too_small += 1
-            continue
-
-        if (config.max_seq_length is not None) and (
-            num_phonemes > config.max_seq_length
-        ):
-            _LOGGER.debug(
-                "Dropping %s (%s > %s)", utt_id, num_phonemes, config.max_seq_length
-            )
-            num_too_large += 1
-            continue
-
-        phonemes[utt_id] = torch.IntTensor(phoneme_ids)
-
-    if (num_too_small > 0) or (num_too_large > 0):
-        _LOGGER.warning(
-            "Dropped some utterance (%s too small, %s too large)",
-            num_too_small,
-            num_too_large,
+        return Batch(
+            phoneme_ids=phonemes_padded,
+            phoneme_lengths=phoneme_lengths,
+            spectrograms=spec_padded,
+            spectrogram_lengths=spec_lengths,
+            audios=audio_padded,
+            audio_lengths=audio_lengths,
+            speaker_ids=speaker_ids,
         )
 
-    return phonemes
 
+class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
+    """
+    Maintain similar input lengths in a batch.
+    Length groups are specified by boundaries.
+    Ex) boundaries = [b1, b2, b3] -> any batch is included either {x | b1 < length(x) <=b2} or {x | b2 < length(x) <= b3}.
 
-def load_mels(jsonl_file: typing.TextIO) -> typing.Dict[str, torch.FloatTensor]:
-    mels = {}
-    for line in jsonl_file:
-        line = line.strip()
-        if not line:
-            continue
+    It removes samples which are not included in the boundaries.
+    Ex) boundaries = [b1, b2, b3] -> any x s.t. length(x) <= b1 or length(x) > b3 are discarded.
+    """
 
-        mel_obj = json.loads(line)
-        utt_id = mel_obj["id"]
-        mels[utt_id] = torch.FloatTensor(mel_obj["mel"])
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        boundaries,
+        num_replicas=None,
+        rank=None,
+        shuffle=True,
+    ):
+        super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
+        self.lengths = [utt.spec_length for utt in dataset]
+        self.batch_size = batch_size
+        self.boundaries = boundaries
 
-    return mels
+        self.buckets, self.num_samples_per_bucket = self._create_buckets()
+        self.total_size = sum(self.num_samples_per_bucket)
+        self.num_samples = self.total_size // self.num_replicas
+
+    def _create_buckets(self):
+        buckets = [[] for _ in range(len(self.boundaries) - 1)]
+        for i in range(len(self.lengths)):
+            length = self.lengths[i]
+            idx_bucket = self._bisect(length)
+            if idx_bucket != -1:
+                buckets[idx_bucket].append(i)
+
+        for i in range(len(buckets) - 1, 0, -1):
+            if len(buckets[i]) == 0:
+                buckets.pop(i)
+                self.boundaries.pop(i + 1)
+
+        num_samples_per_bucket = []
+        for i in range(len(buckets)):
+            len_bucket = len(buckets[i])
+            total_batch_size = self.num_replicas * self.batch_size
+            rem = (
+                total_batch_size - (len_bucket % total_batch_size)
+            ) % total_batch_size
+            num_samples_per_bucket.append(len_bucket + rem)
+        return buckets, num_samples_per_bucket
+
+    def __iter__(self):
+        # deterministically shuffle based on epoch
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+
+        indices = []
+        if self.shuffle:
+            for bucket in self.buckets:
+                indices.append(torch.randperm(len(bucket), generator=g).tolist())
+        else:
+            for bucket in self.buckets:
+                indices.append(list(range(len(bucket))))
+
+        batches = []
+        for i in range(len(self.buckets)):
+            bucket = self.buckets[i]
+            len_bucket = len(bucket)
+            ids_bucket = indices[i]
+            num_samples_bucket = self.num_samples_per_bucket[i]
+
+            # add extra samples to make it evenly divisible
+            rem = num_samples_bucket - len_bucket
+            ids_bucket = (
+                ids_bucket
+                + ids_bucket * (rem // len_bucket)
+                + ids_bucket[: (rem % len_bucket)]
+            )
+
+            # subsample
+            ids_bucket = ids_bucket[self.rank :: self.num_replicas]
+
+            # batching
+            for j in range(len(ids_bucket) // self.batch_size):
+                batch = [
+                    bucket[idx]
+                    for idx in ids_bucket[
+                        j * self.batch_size : (j + 1) * self.batch_size
+                    ]
+                ]
+                batches.append(batch)
+
+        if self.shuffle:
+            batch_ids = torch.randperm(len(batches), generator=g).tolist()
+            batches = [batches[i] for i in batch_ids]
+        self.batches = batches
+
+        assert len(self.batches) * self.batch_size == self.num_samples
+        return iter(self.batches)
+
+    def _bisect(self, x, lo=0, hi=None):
+        if hi is None:
+            hi = len(self.boundaries) - 1
+
+        if hi > lo:
+            mid = (hi + lo) // 2
+            if self.boundaries[mid] < x and x <= self.boundaries[mid + 1]:
+                return mid
+            elif x <= self.boundaries[mid]:
+                return self._bisect(x, lo, mid)
+            else:
+                return self._bisect(x, mid + 1, hi)
+        else:
+            return -1
+
+    def __len__(self):
+        return self.num_samples // self.batch_size
