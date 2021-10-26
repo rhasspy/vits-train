@@ -620,9 +620,6 @@ def main():
                 utt_phoneme_ids[utt_id] = phoneme_ids
                 ids.append(utt_id)
 
-                if len(ids) > 20:
-                    break
-
     model = VITSTraining(
         config=config,
         utt_phoneme_ids=utt_phoneme_ids,
@@ -632,7 +629,7 @@ def main():
         test_ids=test_ids,
         cache_dir="data/ljspeech/wavs",
     )
-    trainer = pl.Trainer(gpus=1, precision=16,)
+    trainer = pl.Trainer(gpus=2, precision=16, accelerator="ddp")
     trainer.fit(model)
 
 

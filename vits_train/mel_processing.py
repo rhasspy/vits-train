@@ -49,9 +49,7 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
     dtype_device = str(y.dtype) + "_" + str(y.device)
     wnsize_dtype_device = str(win_size) + "_" + dtype_device
     if wnsize_dtype_device not in hann_window:
-        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
-            dtype=y.dtype, device=y.device
-        )
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).type_as(y)
 
     y = torch.nn.functional.pad(
         y.unsqueeze(1),
@@ -59,21 +57,6 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
         mode="reflect",
     )
     y = y.squeeze(1)
-
-    # spec = torch.view_as_real(
-    #     torch.stft(
-    #         y,
-    #         n_fft,
-    #         hop_length=hop_size,
-    #         win_length=win_size,
-    #         window=hann_window[wnsize_dtype_device],
-    #         center=center,
-    #         pad_mode="reflect",
-    #         normalized=False,
-    #         onesided=True,
-    #         return_complex=True,
-    #     )
-    # )
 
     spec = torch.stft(
         y,
@@ -99,9 +82,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     fmax_dtype_device = str(fmax) + "_" + dtype_device
     if fmax_dtype_device not in mel_basis:
         mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
-            dtype=spec.dtype, device=spec.device
-        )
+        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).type_as(spec)
     spec = torch.matmul(mel_basis[fmax_dtype_device], spec)
     spec = spectral_normalize_torch(spec)
     return spec
@@ -121,13 +102,9 @@ def mel_spectrogram_torch(
     wnsize_dtype_device = str(win_size) + "_" + dtype_device
     if fmax_dtype_device not in mel_basis:
         mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).to(
-            dtype=y.dtype, device=y.device
-        )
+        mel_basis[fmax_dtype_device] = torch.from_numpy(mel).type_as(y)
     if wnsize_dtype_device not in hann_window:
-        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).to(
-            dtype=y.dtype, device=y.device
-        )
+        hann_window[wnsize_dtype_device] = torch.hann_window(win_size).type_as(y)
 
     y = torch.nn.functional.pad(
         y.unsqueeze(1),
@@ -135,21 +112,6 @@ def mel_spectrogram_torch(
         mode="reflect",
     )
     y = y.squeeze(1)
-
-    # spec = torch.view_as_real(
-    #     torch.stft(
-    #         y,
-    #         n_fft,
-    #         hop_length=hop_size,
-    #         win_length=win_size,
-    #         window=hann_window[wnsize_dtype_device],
-    #         center=center,
-    #         pad_mode="reflect",
-    #         normalized=False,
-    #         onesided=True,
-    #         return_complex=True,
-    #     )
-    # )
 
     spec = torch.stft(
         y,
