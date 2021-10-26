@@ -68,7 +68,7 @@ class TrainingConfig(DataClassJsonMixin):
     learning_rate: float = 2e-4
     betas: typing.Tuple[float, float] = field(default=(0.8, 0.99))
     eps: float = 1e-9
-    batch_size: int = 16
+    batch_size: int = 32
     fp16_run: bool = False
     lr_decay: float = 0.999875
     segment_size: int = 8192
@@ -77,8 +77,11 @@ class TrainingConfig(DataClassJsonMixin):
     c_mel: int = 45
     c_kl: float = 1.0
 
-    min_text_len: typing.Optional[int] = None
-    max_text_len: typing.Optional[int] = None
+    min_phonemes_len: typing.Optional[int] = None
+    max_phonemes_len: typing.Optional[int] = None
+
+    min_spec_len: typing.Optional[int] = None
+    max_spec_len: typing.Optional[int] = None
 
     audio: AudioConfig = field(default_factory=AudioConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

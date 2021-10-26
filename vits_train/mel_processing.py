@@ -1,5 +1,7 @@
 import torch
 import torch.utils.data
+
+import librosa
 from librosa.filters import mel as librosa_mel_fn
 
 MAX_WAV_VALUE = 32768.0
@@ -58,18 +60,38 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
     )
     y = y.squeeze(1)
 
-    spec = torch.stft(
-        y,
-        n_fft,
-        hop_length=hop_size,
-        win_length=win_size,
-        window=hann_window[wnsize_dtype_device],
-        center=center,
-        pad_mode="reflect",
-        normalized=False,
-        onesided=True,
-        return_complex=False,
+    spec = torch.view_as_real(
+        torch.stft(
+            y,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=hann_window[wnsize_dtype_device],
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
     )
+
+    # spec = (
+    #     torch.view_as_real(
+    #         torch.tensor(
+    #             librosa.stft(
+    #                 y=y.squeeze().numpy(),
+    #                 n_fft=n_fft,
+    #                 hop_length=hop_size,
+    #                 win_length=win_size,
+    #                 pad_mode="reflect",
+    #                 window="hann",
+    #                 center=center,
+    #             )
+    #         )
+    #     )
+    #     .contiguous()
+    #     .unsqueeze(0)
+    # )
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
     return spec
@@ -118,18 +140,38 @@ def mel_spectrogram_torch(
     )
     y = y.squeeze(1)
 
-    spec = torch.stft(
-        y,
-        n_fft,
-        hop_length=hop_size,
-        win_length=win_size,
-        window=hann_window[wnsize_dtype_device],
-        center=center,
-        pad_mode="reflect",
-        normalized=False,
-        onesided=True,
-        return_complex=False,
+    spec = torch.view_as_real(
+        torch.stft(
+            y,
+            n_fft,
+            hop_length=hop_size,
+            win_length=win_size,
+            window=hann_window[wnsize_dtype_device],
+            center=center,
+            pad_mode="reflect",
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
     )
+
+    # spec = (
+    #     torch.view_as_real(
+    #         torch.tensor(
+    #             librosa.stft(
+    #                 y=y.squeeze().numpy(),
+    #                 n_fft=n_fft,
+    #                 hop_length=hop_size,
+    #                 win_length=win_size,
+    #                 pad_mode="reflect",
+    #                 window="hann",
+    #                 center=center,
+    #             )
+    #         )
+    #     )
+    #     .contiguous()
+    #     .unsqueeze(0)
+    # )
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + 1e-6)
 

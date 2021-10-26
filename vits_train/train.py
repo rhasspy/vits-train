@@ -1,4 +1,5 @@
 import csv
+import math
 import logging
 import re
 import typing
@@ -14,7 +15,7 @@ from torch.nn import functional as F
 from vits_train import setup_model
 from vits_train.losses import generator_loss, feature_loss, discriminator_loss, kl_loss
 from vits_train.config import TrainingConfig
-from vits_train.commons import slice_segments
+from vits_train.commons import slice_segments, intersperse
 from vits_train.models import MultiPeriodDiscriminator
 from vits_train.mel_processing import (
     spectrogram_torch,
@@ -58,6 +59,117 @@ class VITSTraining(pl.LightningModule):
         self.net_d = MultiPeriodDiscriminator(config.model.use_spectral_norm)
 
         self.collate_fn = UtteranceCollate()
+
+        # Filter utterances based on min/max settings in config
+        drop_utt_ids: typing.Set[str] = set()
+
+        num_phonemes_too_small = 0
+        num_phonemes_too_large = 0
+        num_audio_missing = 0
+        num_spec_too_small = 0
+        num_spec_too_large = 0
+
+        for utt_id, phoneme_ids in utt_phoneme_ids.items():
+            # Check phonemes length
+            if (self.config.min_phonemes_len is not None) and (
+                len(phoneme_ids) < self.config.min_phonemes_len
+            ):
+                drop_utt_ids.add(utt_id)
+                num_phonemes_too_small += 1
+                continue
+
+            if (self.config.max_phonemes_len is not None) and (
+                len(phoneme_ids) > self.config.max_phonemes_len
+            ):
+                drop_utt_ids.add(utt_id)
+                num_phonemes_too_large += 1
+                continue
+
+            # Check if audio file is missing
+            audio_path = self.audio_dir / utt_id
+            if not audio_path.is_file():
+                # Try WAV extension
+                audio_path = self.audio_dir / f"{utt_id}.wav"
+
+            if not audio_path.is_file():
+                drop_utt_ids.add(utt_id)
+                _LOGGER.warning(
+                    "Dropped %s because audio file is missing: %s", utt_id, audio_path
+                )
+                continue
+
+            if (self.config.min_spec_len is None) and (
+                self.config.max_spec_len is None
+            ):
+                # Don't bother checking spectrogram length
+                continue
+
+            # Check estimated spectrogram length
+            duration_sec = librosa.get_duration(filename=str(audio_path))
+            num_samples = int(math.ceil(self.config.audio.sample_rate * duration_sec))
+            spec_length = num_samples // self.config.audio.hop_length
+
+            if (self.config.min_spec_len is not None) and (
+                spec_length < self.config.min_spec_len
+            ):
+                drop_utt_ids.add(utt_id)
+                num_spec_too_small += 1
+                continue
+
+            if (self.config.max_spec_len is not None) and (
+                spec_length > self.config.max_spec_len
+            ):
+                drop_utt_ids.add(utt_id)
+                num_spec_too_large += 1
+                continue
+
+        # Filter out dropped utterances
+        if drop_utt_ids:
+            _LOGGER.info("Dropped %s utterance(s)", len(drop_utt_ids))
+
+            if num_phonemes_too_small > 0:
+                _LOGGER.debug(
+                    "%s utterance(s) dropped whose phoneme length was smaller than %s",
+                    num_phonemes_too_small,
+                    self.config.min_phonemes_len,
+                )
+
+            if num_phonemes_too_large > 0:
+                _LOGGER.debug(
+                    "%s utterance(s) dropped whose phoneme length was larger than %s",
+                    num_phonemes_too_large,
+                    self.config.max_phonemes_len,
+                )
+
+            if num_audio_missing > 0:
+                _LOGGER.debug(
+                    "%s utterance(s) dropped whose audio file was missing",
+                    num_audio_missing,
+                )
+
+            if num_spec_too_small > 0:
+                _LOGGER.debug(
+                    "%s utterance(s) dropped whose spectrogram length was smaller than %s",
+                    num_spec_too_small,
+                    self.config.min_spec_len,
+                )
+
+            if num_spec_too_large > 0:
+                _LOGGER.debug(
+                    "%s utterance(s) dropped whose spectrogram length was larger than %s",
+                    num_spec_too_large,
+                    self.config.max_spec_len,
+                )
+
+            utt_phoneme_ids = {
+                utt_id: phoneme_ids
+                for utt_id, phoneme_ids in utt_phoneme_ids.items()
+                if utt_id not in drop_utt_ids
+            }
+        else:
+            _LOGGER.info("Kept all %s utterances", len(utt_phoneme_ids))
+
+        assert utt_phoneme_ids, "No utterances after filtering"
 
         self.train_dataset = PhonemeIdsAndMelsDataset(
             config=self.config,
@@ -139,7 +251,7 @@ class VITSTraining(pl.LightningModule):
             mel = spec_to_mel_torch(
                 train_batch.spectrograms,
                 self.config.audio.filter_length,
-                self.config.audio.n_mel_channels,
+                self.config.audio.mel_channels,
                 self.config.audio.sample_rate,
                 self.config.audio.mel_fmin,
                 self.config.audio.mel_fmax,
@@ -150,7 +262,7 @@ class VITSTraining(pl.LightningModule):
             y_hat_mel = mel_spectrogram_torch(
                 y_hat.squeeze(1),
                 self.config.audio.filter_length,
-                self.config.audio.n_mel_channels,
+                self.config.audio.mel_channels,
                 self.config.audio.sample_rate,
                 self.config.audio.hop_length,
                 self.config.audio.win_length,
@@ -185,6 +297,8 @@ class VITSTraining(pl.LightningModule):
         )
         loss_disc_all = loss_disc
 
+        _LOGGER.info(loss_disc_all.dtype)
+
         return loss_disc_all
 
     # def validation_step(self, val_batch: Batch, batch_idx, optimizer_idx):
@@ -198,34 +312,34 @@ class VITSTraining(pl.LightningModule):
             self.train_dataset,
             shuffle=False,
             batch_size=self.config.batch_size,
-            pin_memory=True,
+            # pin_memory=True,
             collate_fn=self.collate_fn,
             num_workers=8,
             # TODO: bucket sampler
             # batch_sampler=train_sampler,
         )
 
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            shuffle=False,
-            batch_size=self.config.batch_size,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=self.collate_fn,
-            num_workers=8,
-        )
+    # def val_dataloader(self):
+    #     return DataLoader(
+    #         self.val_dataset,
+    #         shuffle=False,
+    #         batch_size=self.config.batch_size,
+    #         # pin_memory=True,
+    #         drop_last=False,
+    #         collate_fn=self.collate_fn,
+    #         num_workers=8,
+    #     )
 
-    def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            shuffle=False,
-            batch_size=self.config.batch_size,
-            pin_memory=True,
-            drop_last=False,
-            collate_fn=self.collate_fn,
-            num_workers=8,
-        )
+    # def test_dataloader(self):
+    #     return DataLoader(
+    #         self.test_dataset,
+    #         shuffle=False,
+    #         batch_size=self.config.batch_size,
+    #         # pin_memory=True,
+    #         drop_last=False,
+    #         collate_fn=self.collate_fn,
+    #         num_workers=8,
+    #     )
 
 
 # -----------------------------------------------------------------------------
@@ -282,7 +396,7 @@ class PhonemeIdsAndMelsDataset(Dataset):
         if utterance.audio_norm is None:
             # Load audio and resample
             # _LOGGER.debug("Loading audio file: %s", utterance.audio_path)
-            audio, sample_rate = librosa.load(
+            audio, _sample_rate = librosa.load(
                 str(utterance.audio_path), sr=self.config.audio.sample_rate
             )
 
@@ -441,8 +555,14 @@ def main():
                 phoneme_ids = [phoneme_to_id[p] for p in phonemes if p in phoneme_to_id]
 
                 assert phoneme_ids, utt_id
+                phoneme_ids = intersperse(phoneme_ids, 0)
                 utt_phoneme_ids[utt_id] = torch.LongTensor(phoneme_ids)
                 ids.append(utt_id)
+
+                if len(ids) > 20:
+                    break
+
+        break
 
     model = VITSTraining(
         config=config,
@@ -452,7 +572,7 @@ def main():
         val_ids=val_ids,
         test_ids=test_ids,
     )
-    trainer = pl.Trainer(gpus=1)
+    trainer = pl.Trainer(gpus=1, precision=16)
     trainer.fit(model)
 
 
