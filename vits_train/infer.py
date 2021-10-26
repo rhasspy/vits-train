@@ -96,7 +96,7 @@ def main():
         ), f"Model has {config.model.num_symbols}, but phonemes.txt has {num_phonemes}"
 
     # Load checkpoint
-    model = setup_model()
+    model = setup_model(config)
     start_time = time.perf_counter()
 
     # Checkpoint

@@ -3,6 +3,7 @@ import math
 import logging
 import re
 import typing
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,17 +42,18 @@ class VITSTraining(pl.LightningModule):
     def __init__(
         self,
         config: TrainingConfig,
-        utt_phoneme_ids: typing.Mapping[str, torch.LongTensor],
+        utt_phoneme_ids: typing.Mapping[str, typing.Sequence[int]],
         audio_dir: typing.Union[str, Path],
         train_ids: typing.Iterable[str],
         val_ids: typing.Iterable[str],
         test_ids: typing.Iterable[str],
         utt_speaker_ids: typing.Optional[typing.Mapping[str, int]] = None,
+        cache_dir: typing.Optional[typing.Union[str, Path]] = None,
     ):
         super().__init__()
 
         self.config = config
-        self.utt_phoneme_ids = utt_phoneme_ids
+        self.cache_dir = cache_dir
         self.audio_dir = Path(audio_dir)
         self.utt_speaker_ids = utt_speaker_ids if utt_speaker_ids is not None else {}
 
@@ -171,43 +173,49 @@ class VITSTraining(pl.LightningModule):
 
         assert utt_phoneme_ids, "No utterances after filtering"
 
+        train_ids = set(train_ids) - drop_utt_ids
+        assert train_ids, "No training utterances after filtering"
+
+        val_ids = set(val_ids) - drop_utt_ids
+        assert val_ids, "No validation utterances after filtering"
+
+        test_ids = set(test_ids) - drop_utt_ids
+        assert test_ids, "No testing utterances after filtering"
+
         self.train_dataset = PhonemeIdsAndMelsDataset(
             config=self.config,
-            utt_phoneme_ids={
-                utt_id: self.utt_phoneme_ids[utt_id] for utt_id in train_ids
-            },
+            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in train_ids},
             audio_dir=self.audio_dir,
             utt_speaker_ids={
                 utt_id: self.utt_speaker_ids[utt_id]
                 for utt_id in train_ids
                 if utt_id in self.utt_speaker_ids
             },
+            cache_dir=cache_dir,
         )
 
         self.val_dataset = PhonemeIdsAndMelsDataset(
             config=self.config,
-            utt_phoneme_ids={
-                utt_id: self.utt_phoneme_ids[utt_id] for utt_id in val_ids
-            },
+            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in val_ids},
             audio_dir=self.audio_dir,
             utt_speaker_ids={
                 utt_id: self.utt_speaker_ids[utt_id]
                 for utt_id in val_ids
                 if utt_id in self.utt_speaker_ids
             },
+            cache_dir=cache_dir,
         )
 
         self.test_dataset = PhonemeIdsAndMelsDataset(
             config=self.config,
-            utt_phoneme_ids={
-                utt_id: self.utt_phoneme_ids[utt_id] for utt_id in test_ids
-            },
+            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in test_ids},
             audio_dir=self.audio_dir,
             utt_speaker_ids={
                 utt_id: self.utt_speaker_ids[utt_id]
                 for utt_id in test_ids
                 if utt_id in self.utt_speaker_ids
             },
+            cache_dir=cache_dir,
         )
 
     def forward(self, *args, **kwargs):
@@ -249,25 +257,26 @@ class VITSTraining(pl.LightningModule):
 
             self.train_y_hat = y_hat
             mel = spec_to_mel_torch(
-                train_batch.spectrograms,
-                self.config.audio.filter_length,
-                self.config.audio.mel_channels,
-                self.config.audio.sample_rate,
-                self.config.audio.mel_fmin,
-                self.config.audio.mel_fmax,
+                spec=train_batch.spectrograms,
+                n_fft=self.config.audio.filter_length,
+                num_mels=self.config.audio.mel_channels,
+                sampling_rate=self.config.audio.sample_rate,
+                fmin=self.config.audio.mel_fmin,
+                fmax=self.config.audio.mel_fmax,
             )
             y_mel = slice_segments(
                 mel, ids_slice, self.config.segment_size // self.config.audio.hop_length
             )
+
             y_hat_mel = mel_spectrogram_torch(
-                y_hat.squeeze(1),
-                self.config.audio.filter_length,
-                self.config.audio.mel_channels,
-                self.config.audio.sample_rate,
-                self.config.audio.hop_length,
-                self.config.audio.win_length,
-                self.config.audio.mel_fmin,
-                self.config.audio.mel_fmax,
+                y=y_hat.squeeze(1),
+                n_fft=self.config.audio.filter_length,
+                num_mels=self.config.audio.mel_channels,
+                sampling_rate=self.config.audio.sample_rate,
+                hop_size=self.config.audio.hop_length,
+                win_size=self.config.audio.win_length,
+                fmin=self.config.audio.mel_fmin,
+                fmax=self.config.audio.mel_fmax,
             )
 
             y = slice_segments(
@@ -285,27 +294,48 @@ class VITSTraining(pl.LightningModule):
             loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * self.config.c_kl
 
             loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, _losses_gen = generator_loss(y_d_hat_g)
+            loss_gen, losses_gen = generator_loss(y_d_hat_g)
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
-            return loss_gen_all
+            return {
+                "loss": loss_gen_all,
+                # "log": {
+                #     "loss_dur": loss_dur.detach(),
+                #     "loss_mel": loss_mel.detach(),
+                #     "loss_kl": loss_kl.detach(),
+                #     "loss_fm": loss_fm.detach(),
+                #     "loss_gen": loss_gen.detach(),
+                #     "losses_gen": losses_gen,
+                # },
+            }
 
         # Discriminator
         y_d_hat_r, y_d_hat_g, _, _ = self.net_d(self.train_y, self.train_y_hat.detach())
-        loss_disc, _losses_disc_r, _losses_disc_g = discriminator_loss(
+        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
             y_d_hat_r, y_d_hat_g
         )
         loss_disc_all = loss_disc
 
-        _LOGGER.info(loss_disc_all.dtype)
+        return {
+            "loss": loss_disc_all,
+            # "log": {
+            #     "loss_disc": loss_disc.detach(),
+            #     "losses_disc_r": losses_disc_r,
+            #     "losses_disc_g": losses_disc_g,
+            # },
+        }
 
-        return loss_disc_all
+    # def validation_step(self, val_batch: Batch, batch_idx):
+    #     return self.training_step(val_batch, batch_idx, optimizer_idx=0)
 
-    # def validation_step(self, val_batch: Batch, batch_idx, optimizer_idx):
-    #     pass
+    # def test_step(self, test_batch: Batch, batch_idx, optimizer_idx):
+    #     y_hat, *_ = self.net_g.infer(
+    #         test_batch.phoneme_ids,
+    #         test_batch.phoneme_lengths,
+    #         sid=test_batch.speaker_ids,
+    #     )
 
-    # def test_step(self, val_batch: Batch, batch_idx, optimizer_idx):
-    #     pass
+    #     assert False
 
     def train_dataloader(self):
         return DataLoader(
@@ -319,27 +349,27 @@ class VITSTraining(pl.LightningModule):
             # batch_sampler=train_sampler,
         )
 
-    # def val_dataloader(self):
-    #     return DataLoader(
-    #         self.val_dataset,
-    #         shuffle=False,
-    #         batch_size=self.config.batch_size,
-    #         # pin_memory=True,
-    #         drop_last=False,
-    #         collate_fn=self.collate_fn,
-    #         num_workers=8,
-    #     )
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            shuffle=False,
+            batch_size=self.config.batch_size,
+            # pin_memory=True,
+            drop_last=False,
+            collate_fn=self.collate_fn,
+            num_workers=8,
+        )
 
-    # def test_dataloader(self):
-    #     return DataLoader(
-    #         self.test_dataset,
-    #         shuffle=False,
-    #         batch_size=self.config.batch_size,
-    #         # pin_memory=True,
-    #         drop_last=False,
-    #         collate_fn=self.collate_fn,
-    #         num_workers=8,
-    #     )
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            shuffle=False,
+            batch_size=self.config.batch_size,
+            # pin_memory=True,
+            drop_last=False,
+            collate_fn=self.collate_fn,
+            num_workers=8,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -348,26 +378,42 @@ class VITSTraining(pl.LightningModule):
 @dataclass
 class Utterance:
     id: str
-    phoneme_ids: torch.LongTensor
+    phoneme_ids: typing.Sequence[int]
     audio_path: Path
     speaker_id: typing.Optional[int] = None
-    spectrogram: typing.Optional[torch.FloatTensor] = None
-    audio_norm: typing.Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class UtteranceTensors:
+    id: str
+    phoneme_ids: torch.LongTensor
+    spectrogram: torch.FloatTensor
+    audio_norm: torch.FloatTensor
+    speaker_id: typing.Optional[torch.LongTensor] = None
 
 
 class PhonemeIdsAndMelsDataset(Dataset):
     def __init__(
         self,
         config: TrainingConfig,
-        utt_phoneme_ids: typing.Mapping[str, torch.LongTensor],
+        utt_phoneme_ids: typing.Mapping[str, typing.Sequence[int]],
         audio_dir: typing.Union[str, Path],
         utt_speaker_ids: typing.Optional[typing.Mapping[str, int]] = None,
+        cache_dir: typing.Optional[typing.Union[str, Path]] = None,
     ):
         super().__init__()
 
         self.config = config
         self.audio_dir = Path(audio_dir)
         self.utterances: typing.List[Utterance] = []
+
+        self.temp_dir: typing.Optional[tempfile.TemporaryDirectory] = None
+
+        if cache_dir is None:
+            self.temp_dir = tempfile.TemporaryDirectory(prefix="vits_train")
+            self.cache_dir = Path(self.temp_dir.name)
+        else:
+            self.cache_dir = Path(cache_dir)
 
         if utt_speaker_ids is None:
             utt_speaker_ids = {}
@@ -393,43 +439,58 @@ class PhonemeIdsAndMelsDataset(Dataset):
     def __getitem__(self, index):
         utterance = self.utterances[index]
 
-        if utterance.audio_norm is None:
+        audio_norm_path = (
+            self.cache_dir / utterance.audio_path.with_suffix(".norm.pt").name
+        )
+        if audio_norm_path.is_file():
+            audio_norm = torch.load(str(audio_norm_path))
+        else:
             # Load audio and resample
-            # _LOGGER.debug("Loading audio file: %s", utterance.audio_path)
             audio, _sample_rate = librosa.load(
                 str(utterance.audio_path), sr=self.config.audio.sample_rate
             )
 
-            utterance.audio_norm = torch.tensor(
+            audio_norm = torch.FloatTensor(
                 audio / self.config.audio.max_wav_value
             ).unsqueeze(0)
 
-        assert utterance.audio_norm is not None
+            torch.save(audio_norm, str(audio_norm_path))
 
-        if utterance.spectrogram is None:
-            utterance.spectrogram = spectrogram_torch(
-                utterance.audio_norm,
-                self.config.audio.filter_length,
-                self.config.audio.sample_rate,
-                self.config.audio.hop_length,
-                self.config.audio.win_length,
+        spectrogram_path = (
+            self.cache_dir / utterance.audio_path.with_suffix(".spec.pt").name
+        )
+        if spectrogram_path.is_file():
+            spectrogram = torch.load(str(spectrogram_path))
+        else:
+            spectrogram = spectrogram_torch(
+                y=audio_norm,
+                n_fft=self.config.audio.filter_length,
+                sampling_rate=self.config.audio.sample_rate,
+                hop_size=self.config.audio.hop_length,
+                win_size=self.config.audio.win_length,
                 center=False,
             ).squeeze(0)
 
-        assert utterance.spectrogram is not None
+            torch.save(spectrogram, str(spectrogram_path))
 
-        return utterance
+        speaker_id = None
+        if utterance.speaker_id is not None:
+            speaker_id = torch.LongTensor([utterance.speaker_id])
+
+        return UtteranceTensors(
+            id=utterance.id,
+            phoneme_ids=torch.LongTensor(utterance.phoneme_ids),
+            audio_norm=audio_norm,
+            spectrogram=spectrogram,
+            speaker_id=speaker_id,
+        )
 
     def __len__(self):
         return len(self.utterances)
 
 
 class UtteranceCollate:
-    def __call__(self, utterances: typing.Sequence[Utterance]) -> Batch:
-        # _, ids_sorted_decreasing = torch.sort(
-        #     torch.LongTensor([x[1].size(1) for x in utterances]), dim=0, descending=True
-        # )
-
+    def __call__(self, utterances: typing.Sequence[UtteranceTensors]) -> Batch:
         num_utterances = len(utterances)
         assert num_utterances > 0, "No utterances"
 
@@ -556,13 +617,11 @@ def main():
 
                 assert phoneme_ids, utt_id
                 phoneme_ids = intersperse(phoneme_ids, 0)
-                utt_phoneme_ids[utt_id] = torch.LongTensor(phoneme_ids)
+                utt_phoneme_ids[utt_id] = phoneme_ids
                 ids.append(utt_id)
 
                 if len(ids) > 20:
                     break
-
-        break
 
     model = VITSTraining(
         config=config,
@@ -571,8 +630,9 @@ def main():
         train_ids=train_ids,
         val_ids=val_ids,
         test_ids=test_ids,
+        cache_dir="data/ljspeech/wavs",
     )
-    trainer = pl.Trainer(gpus=1, precision=16)
+    trainer = pl.Trainer(gpus=1, precision=16,)
     trainer.fit(model)
 
 
