@@ -5,6 +5,8 @@ import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import librosa
+import numpy as np
 from dataclasses_json import DataClassJsonMixin
 
 
@@ -28,9 +30,180 @@ class AudioConfig(DataClassJsonMixin):
     max_norm: float = 1.0
     clip_norm: bool = True
     symmetric_norm: bool = True
-    do_dynamic_range_compression: bool = False
-    convert_db_to_amp: bool = False
-    max_wav_value: float = 32768.0
+    do_dynamic_range_compression: bool = True
+    convert_db_to_amp: bool = True
+
+    do_trim_silence: bool = False
+    trim_silence_db: float = 60.0
+
+    def __post_init__(self):
+        if self.mel_fmax is not None:
+            assert self.mel_fmax <= self.sample_rate // 2
+
+        # Compute mel bases
+        self._mel_basis = librosa.filters.mel(
+            self.sample_rate,
+            self.filter_length,
+            n_mels=self.mel_channels,
+            fmin=self.mel_fmin,
+            fmax=self.mel_fmax,
+        )
+
+        self._inv_mel_basis = np.linalg.pinv(self._mel_basis)
+
+    # -------------------------------------------------------------------------
+    # Mel Spectrogram
+    # -------------------------------------------------------------------------
+
+    def wav2mel(self, wav: np.ndarray) -> np.ndarray:
+        if self.do_trim_silence:
+            wav = self.trim_silence(wav, trim_db=self.trim_silence_db)
+
+        linear = self.stft(wav)
+        mel_amp = self.linear_to_mel(np.abs(linear))
+        mel_db = self.amp_to_db(mel_amp)
+
+        if self.signal_norm:
+            mel_db = self.normalize(mel_db)
+
+        return mel_db
+
+    def mel2wav(
+        self, mel_db: np.ndarray, num_iters: int = 60, power: float = 1.0
+    ) -> np.ndarray:
+        """Converts melspectrogram to waveform using Griffim-Lim"""
+        if self.signal_norm:
+            mel_db = self.denormalize(mel_db)
+
+        mel_amp = self.db_to_amp(mel_db)
+        linear = self.mel_to_linear(mel_amp) ** power
+
+        return self.griffin_lim(linear, num_iters=num_iters)
+
+    def linear_to_mel(self, linear: np.ndarray) -> np.ndarray:
+        """Linear spectrogram to mel amp"""
+        return np.dot(self._mel_basis, linear)
+
+    def mel_to_linear(
+        self, mel_amp: np.ndarray, threshold: float = 1e-10
+    ) -> np.ndarray:
+        """Mel amp to linear spectrogram"""
+        return np.maximum(threshold, np.dot(self._inv_mel_basis, mel_amp))
+
+    def amp_to_db(self, mel_amp: np.ndarray, threshold: float = 1e-5) -> np.ndarray:
+        return self.spec_gain * np.log10(np.maximum(threshold, mel_amp))
+
+    def db_to_amp(self, mel_db: np.ndarray, power: float = 10.0) -> np.ndarray:
+        return np.power(power, mel_db / self.spec_gain)
+
+    # -------------------------------------------------------------------------
+    # STFT
+    # -------------------------------------------------------------------------
+
+    def stft(self, wav: np.ndarray) -> np.ndarray:
+        """Waveform to linear spectrogram"""
+        return librosa.stft(
+            y=wav,
+            n_fft=self.filter_length,
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            pad_mode="reflect",
+        )
+
+    def istft(self, linear: np.ndarray) -> np.ndarray:
+        """Linear spectrogram to waveform"""
+        return librosa.istft(
+            linear, hop_length=self.hop_length, win_length=self.win_length
+        )
+
+    def griffin_lim(self, linear: np.ndarray, num_iters: int = 60) -> np.ndarray:
+        """Linear spectrogram to waveform using Griffin-Lim"""
+        angles = np.exp(2j * np.pi * np.random.rand(*linear.shape))
+        linear_complex = np.abs(linear).astype(np.complex)
+        audio = self.istft(linear_complex * angles)
+
+        for _ in range(num_iters):
+            angles = np.exp(1j * np.angle(self.stft(audio)))
+            audio = self.istft(linear_complex * angles)
+
+        return audio
+
+    # -------------------------------------------------------------------------
+    # Normalization
+    # -------------------------------------------------------------------------
+
+    def normalize(self, mel_db: np.ndarray) -> np.ndarray:
+        """Put values in [0, max_norm] or [-max_norm, max_norm]"""
+        mel_norm = ((mel_db - self.ref_level_db) - self.min_level_db) / (
+            -self.min_level_db
+        )
+        if self.symmetric_norm:
+            # Symmetric norm
+            mel_norm = ((2 * self.max_norm) * mel_norm) - self.max_norm
+            if self.clip_norm:
+                mel_norm = np.clip(mel_norm, -self.max_norm, self.max_norm)
+        else:
+            # Asymmetric norm
+            mel_norm = self.max_norm * mel_norm
+            if self.clip_norm:
+                mel_norm = np.clip(mel_norm, 0, self.max_norm)
+
+        return mel_norm
+
+    def denormalize(self, mel_db: np.ndarray) -> np.ndarray:
+        """Pull values out of [0, max_norm] or [-max_norm, max_norm]"""
+        if self.symmetric_norm:
+            # Symmetric norm
+            if self.clip_norm:
+                mel_denorm = np.clip(mel_db, -self.max_norm, self.max_norm)
+
+            mel_denorm = (
+                (mel_denorm + self.max_norm) * -self.min_level_db / (2 * self.max_norm)
+            ) + self.min_level_db
+        else:
+            # Asymmetric norm
+            if self.clip_norm:
+                mel_denorm = np.clip(mel_db, 0, self.max_norm)
+
+            mel_denorm = (
+                mel_denorm * -self.min_level_db / self.max_norm
+            ) + self.min_level_db
+
+        mel_denorm += self.ref_level_db
+
+        return mel_denorm
+
+    # -------------------------------------------------------------------------
+    # Silence Trimming
+    # -------------------------------------------------------------------------
+
+    def trim_silence(
+        self,
+        wav: np.ndarray,
+        trim_db: float = 60.0,
+        margin_sec: float = 0.01,
+        keep_sec: float = 0.1,
+    ):
+        """
+        Trim silent parts with a threshold and margin.
+        Keep keep_sec seconds on either side of trimmed audio.
+        """
+        margin = int(self.sample_rate * margin_sec)
+        wav = wav[margin:-margin]
+        _, trim_index = librosa.effects.trim(
+            wav,
+            top_db=trim_db,
+            frame_length=self.win_length,
+            hop_length=self.hop_length,
+        )
+
+        keep_samples = int(self.sample_rate * keep_sec)
+        trim_start, trim_end = (
+            max(0, trim_index[0] - keep_samples),
+            min(len(wav), trim_index[1] + keep_samples),
+        )
+
+        return wav[trim_start:trim_end]
 
 
 @dataclass
@@ -76,13 +249,17 @@ class TrainingConfig(DataClassJsonMixin):
     warmup_epochs: int = 0
     c_mel: int = 45
     c_kl: float = 1.0
+    grad_clip: typing.Optional[float] = None
 
-    min_phonemes_len: typing.Optional[int] = None
-    max_phonemes_len: typing.Optional[int] = None
+    min_seq_length: typing.Optional[int] = None
+    max_seq_length: typing.Optional[int] = None
 
-    min_spec_len: typing.Optional[int] = None
-    max_spec_len: typing.Optional[int] = None
+    min_spec_length: typing.Optional[int] = None
+    max_spec_length: typing.Optional[int] = None
 
+    last_epoch: int = 1
+    global_step: int = 1
+    best_loss: typing.Optional[float] = None
     audio: AudioConfig = field(default_factory=AudioConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     version: int = 1

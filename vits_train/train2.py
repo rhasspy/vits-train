@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
-import re
 import csv
-import math
-import typing
-import os
 import logging
+import math
+import os
+import re
+import typing
 from pathlib import Path
 
 import librosa
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import torch.multiprocessing as mp
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import autocast, GradScaler
 
-from vits_train import commons, utils
+from vits_train import commons, setup_model, utils
 from vits_train.config import TrainingConfig
 from vits_train.dataset import (
+    Batch,
+    DistributedBucketSampler,
     PhonemeIdsAndMelsDataset,
     UtteranceCollate,
-    DistributedBucketSampler,
-    Batch,
 )
-from vits_train import setup_model
-from vits_train.models import MultiPeriodDiscriminator
-from vits_train.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
+from vits_train.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from vits_train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
-
+from vits_train.models import MultiPeriodDiscriminator
 
 torch.backends.cudnn.benchmark = True
 global_step = 0

@@ -137,9 +137,7 @@ class Decoder(nn.Module):
     x: decoder input
     h: encoder output
     """
-        self_attn_mask = subsequent_mask(x_mask.size(2)).to(
-            device=x.device, dtype=x.dtype
-        )
+        self_attn_mask = subsequent_mask(x_mask.size(2)).type_as(x)
         encdec_attn_mask = h_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
         x = x * x_mask
         for i in range(self.n_layers):
@@ -242,9 +240,7 @@ class MultiHeadAttention(nn.Module):
             scores = scores + scores_local
         if self.proximal_bias:
             assert t_s == t_t, "Proximal bias is only available for self-attention."
-            scores = scores + self._attention_bias_proximal(t_s).to(
-                device=scores.device, dtype=scores.dtype
-            )
+            scores = scores + self._attention_bias_proximal(t_s).type_as(scores)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e4)
             if self.block_length is not None:

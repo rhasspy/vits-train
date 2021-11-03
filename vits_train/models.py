@@ -7,8 +7,7 @@ from torch.nn import AvgPool1d, Conv1d, Conv2d, ConvTranspose1d
 from torch.nn import functional as F
 from torch.nn.utils import remove_weight_norm, spectral_norm, weight_norm
 
-from vits_train import monotonic_align
-from vits_train import attentions, commons, modules
+from vits_train import attentions, commons, modules, monotonic_align
 from vits_train.commons import get_padding, init_weights
 
 
@@ -78,10 +77,7 @@ class StochasticDurationPredictor(nn.Module):
             h_w = self.post_pre(w)
             h_w = self.post_convs(h_w, x_mask)
             h_w = self.post_proj(h_w) * x_mask
-            e_q = (
-                torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype)
-                * x_mask
-            )
+            e_q = torch.randn(w.size(0), 2, w.size(2)).type_as(x) * x_mask
             z_q = e_q
             for flow in self.post_flows:
                 z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
@@ -112,10 +108,7 @@ class StochasticDurationPredictor(nn.Module):
         else:
             flows = list(reversed(self.flows))
             flows = flows[:-2] + [flows[-1]]  # remove a useless vflow
-            z = (
-                torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype)
-                * noise_scale
-            )
+            z = torch.randn(x.size(0), 2, x.size(2)).type_as(x) * noise_scale
 
             for flow in flows:
                 z = flow(z, x_mask, g=x, reverse=reverse)
@@ -205,9 +198,9 @@ class TextEncoder(nn.Module):
     def forward(self, x, x_lengths):
         x = self.emb(x) * math.sqrt(self.hidden_channels)  # [b, t, h]
         x = torch.transpose(x, 1, -1)  # [b, h, t]
-        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
-            x.dtype
-        )
+        x_mask = torch.unsqueeze(
+            commons.sequence_mask(x_lengths, x.size(2)), 1
+        ).type_as(x)
 
         x = self.encoder(x * x_mask, x_mask)
         stats = self.proj(x) * x_mask
@@ -292,9 +285,9 @@ class PosteriorEncoder(nn.Module):
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, x, x_lengths, g=None):
-        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
-            x.dtype
-        )
+        x_mask = torch.unsqueeze(
+            commons.sequence_mask(x_lengths, x.size(2)), 1
+        ).type_as(x)
         x = self.pre(x) * x_mask
         x = self.enc(x, x_mask, g=g)
         stats = self.proj(x) * x_mask
@@ -468,7 +461,7 @@ class DiscriminatorP(torch.nn.Module):
 class DiscriminatorS(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
         super(DiscriminatorS, self).__init__()
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
+        norm_f = spectral_norm if use_spectral_norm else weight_norm
         self.convs = nn.ModuleList(
             [
                 norm_f(Conv1d(1, 16, 15, 1, padding=7)),
@@ -704,8 +697,8 @@ class SynthesizerTrn(nn.Module):
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
-            x_mask.dtype
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).type_as(
+            x_mask
         )
         attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
         attn = commons.generate_path(w_ceil, attn_mask)

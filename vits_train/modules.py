@@ -389,7 +389,7 @@ class Flip(nn.Module):
     def forward(self, x: torch.Tensor, *args, reverse: bool = False, **kwargs):
         x = torch.flip(x, [1])
         if not reverse:
-            logdet = torch.zeros(x.size(0)).to(dtype=x.dtype, device=x.device)
+            logdet = torch.zeros(x.size(0)).type_as(x)
             return x, logdet
         else:
             return x

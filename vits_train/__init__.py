@@ -4,10 +4,10 @@ from vits_train.config import TrainingConfig
 from vits_train.models import SynthesizerTrn
 
 
-def setup_model(config: TrainingConfig) -> SynthesizerTrn:
+def setup_model(config: TrainingConfig, use_cuda: bool = True) -> SynthesizerTrn:
     """Set up a synthesizer from a training configuration"""
 
-    return SynthesizerTrn(
+    model = SynthesizerTrn(
         n_vocab=config.model.num_symbols,
         spec_channels=config.audio.filter_length // 2 + 1,
         segment_size=config.segment_size // config.audio.hop_length,
@@ -28,3 +28,8 @@ def setup_model(config: TrainingConfig) -> SynthesizerTrn:
         gin_channels=config.model.gin_channels,
         use_sdp=config.model.use_sdp,
     )
+
+    if use_cuda:
+        model.cuda()
+
+    return model

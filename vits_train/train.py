@@ -1,245 +1,248 @@
-import csv
-import math
 import logging
-import re
+import time
 import typing
-import tempfile
-from dataclasses import dataclass
+from collections import Counter
 from pathlib import Path
 
-import librosa
-import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset
+import torch.distributed
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 from vits_train import setup_model
-from vits_train.losses import generator_loss, feature_loss, discriminator_loss, kl_loss
+from vits_train.checkpoint import Checkpoint, save_checkpoint
+from vits_train.commons import clip_grad_value_, slice_segments
 from vits_train.config import TrainingConfig
-from vits_train.commons import slice_segments, intersperse
-from vits_train.models import MultiPeriodDiscriminator
-from vits_train.mel_processing import (
-    spectrogram_torch,
-    spec_to_mel_torch,
-    mel_spectrogram_torch,
-)
+from vits_train.dataset import Batch
+from vits_train.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from vits_train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from vits_train.models import MultiPeriodDiscriminator, SynthesizerTrn
+from vits_train.utils import to_gpu
 
-_LOGGER = logging.getLogger("vits_train.train")
+_LOGGER = logging.getLogger("gits_train")
 
-
-@dataclass
-class Batch:
-    phoneme_ids: torch.LongTensor
-    phoneme_lengths: torch.LongTensor
-    spectrograms: torch.FloatTensor
-    spectrogram_lengths: torch.LongTensor
-    audios: torch.FloatTensor
-    audio_lengths: torch.LongTensor
-    speaker_ids: typing.Optional[torch.LongTensor] = None
+# -----------------------------------------------------------------------------
 
 
-class VITSTraining(pl.LightningModule):
-    def __init__(
-        self,
-        config: TrainingConfig,
-        utt_phoneme_ids: typing.Mapping[str, typing.Sequence[int]],
-        audio_dir: typing.Union[str, Path],
-        train_ids: typing.Iterable[str],
-        val_ids: typing.Iterable[str],
-        test_ids: typing.Iterable[str],
-        utt_speaker_ids: typing.Optional[typing.Mapping[str, int]] = None,
-        cache_dir: typing.Optional[typing.Union[str, Path]] = None,
-    ):
-        super().__init__()
+def train(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    config: TrainingConfig,
+    model_dir: Path,
+    model_g: typing.Optional[SynthesizerTrn] = None,
+    model_d: typing.Optional[MultiPeriodDiscriminator] = None,
+    optimizer_g: typing.Optional[torch.optim.AdamW] = None,
+    optimizer_d: typing.Optional[torch.optim.AdamW] = None,
+    scheduler_g: typing.Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scheduler_d: typing.Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    checkpoint_epochs: int = 1,
+    val_epochs: int = 1,
+    rank: int = 0,
+):
+    """Run training for the specified number of epochs"""
+    torch.backends.cudnn.benchmark = True
+    torch.manual_seed(config.seed)
 
-        self.config = config
-        self.cache_dir = cache_dir
-        self.audio_dir = Path(audio_dir)
-        self.utt_speaker_ids = utt_speaker_ids if utt_speaker_ids is not None else {}
+    if model_g is None:
+        model_g = setup_model(config)
 
-        self.net_g = setup_model(config)
-        self.net_d = MultiPeriodDiscriminator(config.model.use_spectral_norm)
+    assert model_g is not None
 
-        self.collate_fn = UtteranceCollate()
+    if model_d is None:
+        model_d = MultiPeriodDiscriminator(
+            use_spectral_norm=config.model.use_spectral_norm
+        )
+        model_d.cuda()
 
-        # Filter utterances based on min/max settings in config
-        drop_utt_ids: typing.Set[str] = set()
+    assert model_d is not None
 
-        num_phonemes_too_small = 0
-        num_phonemes_too_large = 0
-        num_audio_missing = 0
-        num_spec_too_small = 0
-        num_spec_too_large = 0
-
-        for utt_id, phoneme_ids in utt_phoneme_ids.items():
-            # Check phonemes length
-            if (self.config.min_phonemes_len is not None) and (
-                len(phoneme_ids) < self.config.min_phonemes_len
-            ):
-                drop_utt_ids.add(utt_id)
-                num_phonemes_too_small += 1
-                continue
-
-            if (self.config.max_phonemes_len is not None) and (
-                len(phoneme_ids) > self.config.max_phonemes_len
-            ):
-                drop_utt_ids.add(utt_id)
-                num_phonemes_too_large += 1
-                continue
-
-            # Check if audio file is missing
-            audio_path = self.audio_dir / utt_id
-            if not audio_path.is_file():
-                # Try WAV extension
-                audio_path = self.audio_dir / f"{utt_id}.wav"
-
-            if not audio_path.is_file():
-                drop_utt_ids.add(utt_id)
-                _LOGGER.warning(
-                    "Dropped %s because audio file is missing: %s", utt_id, audio_path
-                )
-                continue
-
-            if (self.config.min_spec_len is None) and (
-                self.config.max_spec_len is None
-            ):
-                # Don't bother checking spectrogram length
-                continue
-
-            # Check estimated spectrogram length
-            duration_sec = librosa.get_duration(filename=str(audio_path))
-            num_samples = int(math.ceil(self.config.audio.sample_rate * duration_sec))
-            spec_length = num_samples // self.config.audio.hop_length
-
-            if (self.config.min_spec_len is not None) and (
-                spec_length < self.config.min_spec_len
-            ):
-                drop_utt_ids.add(utt_id)
-                num_spec_too_small += 1
-                continue
-
-            if (self.config.max_spec_len is not None) and (
-                spec_length > self.config.max_spec_len
-            ):
-                drop_utt_ids.add(utt_id)
-                num_spec_too_large += 1
-                continue
-
-        # Filter out dropped utterances
-        if drop_utt_ids:
-            _LOGGER.info("Dropped %s utterance(s)", len(drop_utt_ids))
-
-            if num_phonemes_too_small > 0:
-                _LOGGER.debug(
-                    "%s utterance(s) dropped whose phoneme length was smaller than %s",
-                    num_phonemes_too_small,
-                    self.config.min_phonemes_len,
-                )
-
-            if num_phonemes_too_large > 0:
-                _LOGGER.debug(
-                    "%s utterance(s) dropped whose phoneme length was larger than %s",
-                    num_phonemes_too_large,
-                    self.config.max_phonemes_len,
-                )
-
-            if num_audio_missing > 0:
-                _LOGGER.debug(
-                    "%s utterance(s) dropped whose audio file was missing",
-                    num_audio_missing,
-                )
-
-            if num_spec_too_small > 0:
-                _LOGGER.debug(
-                    "%s utterance(s) dropped whose spectrogram length was smaller than %s",
-                    num_spec_too_small,
-                    self.config.min_spec_len,
-                )
-
-            if num_spec_too_large > 0:
-                _LOGGER.debug(
-                    "%s utterance(s) dropped whose spectrogram length was larger than %s",
-                    num_spec_too_large,
-                    self.config.max_spec_len,
-                )
-
-            utt_phoneme_ids = {
-                utt_id: phoneme_ids
-                for utt_id, phoneme_ids in utt_phoneme_ids.items()
-                if utt_id not in drop_utt_ids
-            }
-        else:
-            _LOGGER.info("Kept all %s utterances", len(utt_phoneme_ids))
-
-        assert utt_phoneme_ids, "No utterances after filtering"
-
-        train_ids = set(train_ids) - drop_utt_ids
-        assert train_ids, "No training utterances after filtering"
-
-        val_ids = set(val_ids) - drop_utt_ids
-        assert val_ids, "No validation utterances after filtering"
-
-        test_ids = set(test_ids) - drop_utt_ids
-        assert test_ids, "No testing utterances after filtering"
-
-        self.train_dataset = PhonemeIdsAndMelsDataset(
-            config=self.config,
-            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in train_ids},
-            audio_dir=self.audio_dir,
-            utt_speaker_ids={
-                utt_id: self.utt_speaker_ids[utt_id]
-                for utt_id in train_ids
-                if utt_id in self.utt_speaker_ids
-            },
-            cache_dir=cache_dir,
+    if optimizer_g is None:
+        optimizer_g = torch.optim.AdamW(
+            model_g.parameters(),
+            config.learning_rate,
+            betas=config.betas,
+            eps=config.eps,
         )
 
-        self.val_dataset = PhonemeIdsAndMelsDataset(
-            config=self.config,
-            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in val_ids},
-            audio_dir=self.audio_dir,
-            utt_speaker_ids={
-                utt_id: self.utt_speaker_ids[utt_id]
-                for utt_id in val_ids
-                if utt_id in self.utt_speaker_ids
-            },
-            cache_dir=cache_dir,
+    assert optimizer_g is not None
+
+    if optimizer_d is None:
+        optimizer_d = torch.optim.AdamW(
+            model_d.parameters(),
+            config.learning_rate,
+            betas=config.betas,
+            eps=config.eps,
         )
 
-        self.test_dataset = PhonemeIdsAndMelsDataset(
-            config=self.config,
-            utt_phoneme_ids={utt_id: utt_phoneme_ids[utt_id] for utt_id in test_ids},
-            audio_dir=self.audio_dir,
-            utt_speaker_ids={
-                utt_id: self.utt_speaker_ids[utt_id]
-                for utt_id in test_ids
-                if utt_id in self.utt_speaker_ids
-            },
-            cache_dir=cache_dir,
+    assert optimizer_d is not None
+
+    if scheduler_g is None:
+        scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer_g, gamma=config.lr_decay,
         )
 
-    def forward(self, *args, **kwargs):
-        return self.net_g(*args, **kwargs)
+    assert scheduler_g is not None
 
-    def configure_optimizers(self):
-        optim_g = torch.optim.AdamW(
-            self.net_g.parameters(),
-            self.config.learning_rate,
-            betas=self.config.betas,
-            eps=self.config.eps,
-        )
-        optim_d = torch.optim.AdamW(
-            self.net_d.parameters(),
-            self.config.learning_rate,
-            betas=self.config.betas,
-            eps=self.config.eps,
+    if scheduler_d is None:
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer_d, gamma=config.lr_decay,
         )
 
-        return optim_g, optim_d
+    assert scheduler_d is not None
 
-    def training_step(self, train_batch: Batch, batch_idx: int, optimizer_idx: int):
+    # Gradient scaler
+    scaler = GradScaler(enabled=config.fp16_run)
+    if config.fp16_run:
+        _LOGGER.info("Using fp16 scaler")
 
-        if optimizer_idx == 0:
+    # Begin training
+    best_val_loss = config.best_loss
+    global_step = config.global_step
+
+    bad_utterance_counts = Counter()
+    bad_utterances_path = model_dir / "bad_utterances.txt"
+
+    if bad_utterances_path.is_file():
+        # Load bad counts
+        with open(bad_utterances_path, "r", encoding="utf-8") as bad_utterances_file:
+            for line in bad_utterances_file:
+                line = line.strip()
+                if not line:
+                    continue
+
+                utt_id, count_str = line.split(maxsplit=1)
+                bad_utterance_counts[utt_id] = int(count_str)
+
+    for epoch in range(config.last_epoch, config.epochs + 1):
+        _LOGGER.debug(
+            "Begin epoch %s/%s (global step=%s, learning_rates=%s)",
+            epoch,
+            config.epochs,
+            global_step,
+            [optimizer_g.param_groups[0]["lr"], optimizer_d.param_groups[0]["lr"]],
+        )
+        epoch_start_time = time.perf_counter()
+        global_step = train_step(
+            rank=rank,
+            global_step=global_step,
+            epoch=epoch,
+            model_g=model_g,
+            model_d=model_d,
+            optimizer_g=optimizer_g,
+            optimizer_d=optimizer_d,
+            config=config,
+            train_loader=train_loader,
+            scaler=scaler,
+            bad_utterance_counts=bad_utterance_counts,
+        )
+
+        scheduler_g.step()
+        scheduler_d.step()
+
+        # if ((epoch % val_epochs) == 0) and (rank == 0):
+        #     _LOGGER.debug("Running validation")
+        #     val_loss = val_step(
+        #         model_g=model_g, model_d=model_d, config=config, val_loader=val_loader,
+        #     )
+
+        #     _LOGGER.debug("Validation loss: %s (best=%s)", val_loss, best_val_loss)
+
+        #     if (best_val_loss is None) or (val_loss < best_val_loss):
+        #         best_path = model_dir / "best_model.pth"
+        #         _LOGGER.debug("Saving best model to %s", best_path)
+        #         save_checkpoint(
+        #             Checkpoint(
+        #                 model_g=model_g,
+        #                 model_d=model_d,
+        #                 optimizer_g=optimizer_g,
+        #                 optimizer_d=optimizer_d,
+        #                 scheduler_g=scheduler_g,
+        #                 scheduler_d=scheduler_d,
+        #                 global_step=global_step,
+        #                 epoch=epoch,
+        #                 version=config.version,
+        #                 best_loss=best_val_loss,
+        #             ),
+        #             best_path,
+        #         )
+
+        #         best_val_loss = val_loss
+
+        #     with open(
+        #         bad_utterances_path, "w", encoding="utf-8"
+        #     ) as bad_utterances_file:
+        #         for utt_id, bad_count in bad_utterance_counts.most_common():
+        #             print(utt_id, bad_count, file=bad_utterances_file)
+
+        if ((epoch % checkpoint_epochs) == 0) and (rank == 0):
+            # Save checkpoint
+            checkpoint_path = model_dir / f"checkpoint_{global_step}.pth"
+            _LOGGER.debug("Saving checkpoint to %s", checkpoint_path)
+            save_checkpoint(
+                Checkpoint(
+                    model_g=model_g,
+                    model_d=model_d,
+                    optimizer_g=optimizer_g,
+                    optimizer_d=optimizer_d,
+                    scheduler_g=scheduler_g,
+                    scheduler_d=scheduler_d,
+                    global_step=global_step,
+                    epoch=epoch,
+                    version=config.version,
+                    best_loss=best_val_loss,
+                ),
+                checkpoint_path,
+            )
+
+        epoch_end_time = time.perf_counter()
+        _LOGGER.debug(
+            "[%s] epoch %s complete in %s second(s) (global step=%s)",
+            rank,
+            epoch,
+            epoch_end_time - epoch_start_time,
+            global_step,
+        )
+
+
+def train_step(
+    rank: int,
+    global_step: int,
+    epoch: int,
+    model_g: SynthesizerTrn,
+    model_d: MultiPeriodDiscriminator,
+    optimizer_g: torch.optim.Optimizer,
+    optimizer_d: torch.optim.Optimizer,
+    config: TrainingConfig,
+    train_loader: DataLoader,
+    scaler: GradScaler,
+    bad_utterance_counts: typing.Optional[typing.Counter[str]] = None,
+):
+    steps_per_epoch = len(train_loader)
+
+    # all_loss_g: typing.List[float] = []
+    # last_loss_g = None
+
+    model_g.train()
+    model_d.train()
+
+    for batch_idx, batch in enumerate(train_loader):
+        batch = typing.cast(Batch, batch)
+        x, x_lengths, y, _y_lengths, spec, spec_lengths, speaker_ids = (
+            to_gpu(batch.phoneme_ids),
+            to_gpu(batch.phoneme_lengths),
+            to_gpu(batch.audios),
+            to_gpu(batch.audio_lengths),
+            to_gpu(batch.spectrograms),
+            to_gpu(batch.spectrogram_lengths),
+            to_gpu(batch.speaker_ids) if batch.speaker_ids is not None else None,
+        )
+
+        # Train model
+        optimizer_g.zero_grad()
+        optimizer_d.zero_grad()
+
+        with autocast(enabled=config.fp16_run):
             (
                 y_hat,
                 l_length,
@@ -248,390 +251,148 @@ class VITSTraining(pl.LightningModule):
                 _x_mask,
                 z_mask,
                 (_z, z_p, m_p, logs_p, _m_q, logs_q),
-            ) = self.net_g(
-                train_batch.phoneme_ids,
-                train_batch.phoneme_lengths,
-                train_batch.spectrograms,
-                train_batch.spectrogram_lengths,
-            )
+            ) = model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
 
-            self.train_y_hat = y_hat
             mel = spec_to_mel_torch(
-                spec=train_batch.spectrograms,
-                n_fft=self.config.audio.filter_length,
-                num_mels=self.config.audio.mel_channels,
-                sampling_rate=self.config.audio.sample_rate,
-                fmin=self.config.audio.mel_fmin,
-                fmax=self.config.audio.mel_fmax,
+                spec,
+                config.audio.filter_length,
+                config.audio.mel_channels,
+                config.audio.sample_rate,
+                config.audio.mel_fmin,
+                config.audio.mel_fmax,
             )
             y_mel = slice_segments(
-                mel, ids_slice, self.config.segment_size // self.config.audio.hop_length
+                mel, ids_slice, config.segment_size // config.audio.hop_length
             )
-
             y_hat_mel = mel_spectrogram_torch(
-                y=y_hat.squeeze(1),
-                n_fft=self.config.audio.filter_length,
-                num_mels=self.config.audio.mel_channels,
-                sampling_rate=self.config.audio.sample_rate,
-                hop_size=self.config.audio.hop_length,
-                win_size=self.config.audio.win_length,
-                fmin=self.config.audio.mel_fmin,
-                fmax=self.config.audio.mel_fmax,
+                y_hat.squeeze(1),
+                config.audio.filter_length,
+                config.audio.mel_channels,
+                config.audio.sample_rate,
+                config.audio.hop_length,
+                config.audio.win_length,
+                config.audio.mel_fmin,
+                config.audio.mel_fmax,
             )
 
             y = slice_segments(
-                train_batch.audios,
-                ids_slice * self.config.audio.hop_length,
-                self.config.segment_size,
+                y, ids_slice * config.audio.hop_length, config.segment_size
             )  # slice
 
-            self.train_y = y
+            # Discriminator
+            y_d_hat_r, y_d_hat_g, _, _ = model_d(y, y_hat.detach())
+            with autocast(enabled=False):
+                loss_disc, _losses_disc_r, _losses_disc_g = discriminator_loss(
+                    y_d_hat_r, y_d_hat_g
+                )
+                loss_disc_all = loss_disc
 
+        # Discriminator loss
+        # Run here because loss variable is modified
+        scaler.scale(loss_disc_all).backward()
+        scaler.unscale_(optimizer_d)
+        clip_grad_value_(model_d.parameters(), config.grad_clip)
+        scaler.step(optimizer_d)
+
+        with autocast(enabled=config.fp16_run):
             # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.net_d(y, y_hat)
-            loss_dur = torch.sum(l_length.float())
-            loss_mel = F.l1_loss(y_mel, y_hat_mel) * self.config.c_mel
-            loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * self.config.c_kl
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = model_d(y, y_hat)
+            with autocast(enabled=False):
+                loss_dur = torch.sum(l_length.float())
+                loss_mel = F.l1_loss(y_mel, y_hat_mel) * config.c_mel
+                loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.c_kl
 
-            loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, losses_gen = generator_loss(y_d_hat_g)
-            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+                loss_fm = feature_loss(fmap_r, fmap_g)
+                loss_gen, _losses_gen = generator_loss(y_d_hat_g)
+                loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
-            return {
-                "loss": loss_gen_all,
-                # "log": {
-                #     "loss_dur": loss_dur.detach(),
-                #     "loss_mel": loss_mel.detach(),
-                #     "loss_kl": loss_kl.detach(),
-                #     "loss_fm": loss_fm.detach(),
-                #     "loss_gen": loss_gen.detach(),
-                #     "losses_gen": losses_gen,
-                # },
-            }
 
-        # Discriminator
-        y_d_hat_r, y_d_hat_g, _, _ = self.net_d(self.train_y, self.train_y_hat.detach())
-        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-            y_d_hat_r, y_d_hat_g
+        # Generator loss
+        scaler.scale(loss_gen_all).backward()
+        scaler.unscale_(optimizer_g)
+        clip_grad_value_(model_g.parameters(), config.grad_clip)
+        scaler.step(optimizer_g)
+
+        scaler.update()
+
+        _LOGGER.debug(
+            "[%s] loss: gen=%s, disc=%s (step=%s/%s)",
+            rank,
+            loss_gen_all.item(),
+            loss_disc_all.item(),
+            batch_idx + 1,
+            steps_per_epoch,
         )
-        loss_disc_all = loss_disc
+        global_step += 1
 
-        return {
-            "loss": loss_disc_all,
-            # "log": {
-            #     "loss_disc": loss_disc.detach(),
-            #     "losses_disc_r": losses_disc_r,
-            #     "losses_disc_g": losses_disc_g,
-            # },
-        }
+    #     if (
+    #         (bad_utterance_counts is not None)
+    #         and (last_loss_g is not None)
+    #         and (loss_g_num > last_loss_g)
+    #     ):
+    #         for utt_id in batch.utterance_ids:
+    #             bad_utterance_counts[utt_id] += 1
 
-    # def validation_step(self, val_batch: Batch, batch_idx):
-    #     return self.training_step(val_batch, batch_idx, optimizer_idx=0)
+    #     last_loss_g = loss_g_num
 
-    # def test_step(self, test_batch: Batch, batch_idx, optimizer_idx):
-    #     y_hat, *_ = self.net_g.infer(
-    #         test_batch.phoneme_ids,
-    #         test_batch.phoneme_lengths,
-    #         sid=test_batch.speaker_ids,
+    # if all_loss_g:
+    #     avg_loss_g = sum(all_loss_g) / len(all_loss_g)
+    #     _LOGGER.info(
+    #         "[%s] avg. Loss for epoch %s: %s (global step=%s)",
+    #         rank,
+    #         epoch,
+    #         avg_loss_g,
+    #         global_step,
     #     )
 
-    #     assert False
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            shuffle=False,
-            batch_size=self.config.batch_size,
-            # pin_memory=True,
-            collate_fn=self.collate_fn,
-            num_workers=8,
-            # TODO: bucket sampler
-            # batch_sampler=train_sampler,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            shuffle=False,
-            batch_size=self.config.batch_size,
-            # pin_memory=True,
-            drop_last=False,
-            collate_fn=self.collate_fn,
-            num_workers=8,
-        )
-
-    def test_dataloader(self):
-        return DataLoader(
-            self.test_dataset,
-            shuffle=False,
-            batch_size=self.config.batch_size,
-            # pin_memory=True,
-            drop_last=False,
-            collate_fn=self.collate_fn,
-            num_workers=8,
-        )
+    return global_step
 
 
-# -----------------------------------------------------------------------------
+# def val_step(
+#     model_g: SynthesizerTrn, config: TrainingConfig, val_loader: DataLoader,
+# ):
+#     all_loss_g: typing.List[float] = []
 
+#     model_g.eval()
+#     with torch.no_grad():
+#         for batch in val_loader:
+#             batch = typing.cast(Batch, batch)
+#             x, x_lengths, y, _y_lengths, spec, spec_lengths, speaker_ids = (
+#                 to_gpu(batch.phoneme_ids),
+#                 to_gpu(batch.phoneme_lengths),
+#                 to_gpu(batch.audios),
+#                 to_gpu(batch.audio_lengths),
+#                 to_gpu(batch.spectrograms),
+#                 to_gpu(batch.spectrogram_lengths),
+#                 to_gpu(batch.speaker_ids) if batch.speaker_ids is not None else None,
+#             )
 
-@dataclass
-class Utterance:
-    id: str
-    phoneme_ids: typing.Sequence[int]
-    audio_path: Path
-    speaker_id: typing.Optional[int] = None
+#             y_hat, attn, mask, *_ = model_g.infer(x, x_lengths, speakers, max_len=1000)
+#             y_hat_lengths = mask.sum([1, 2]).long() * config.audio.hop_length
 
+#             mel = spec_to_mel_torch(
+#                 spec,
+#                 config.audio.filter_length,
+#                 config.audio.mel_channels,
+#                 config.audio.sample_rate,
+#                 config.audio.mel_fmin,
+#                 config.audio.mel_fmax,
+#             )
+#             y_hat_mel = mel_spectrogram_torch(
+#                 y_hat.squeeze(1).float(),
+#                 config.audio.filter_length,
+#                 config.audio.mel_channels,
+#                 config.audio.sample_rate,
+#                 config.audio.hop_length,
+#                 config.audio.win_length,
+#                 config.audio.mel_fmin,
+#                 config.audio.mel_fmax,
+#             )
 
-@dataclass
-class UtteranceTensors:
-    id: str
-    phoneme_ids: torch.LongTensor
-    spectrogram: torch.FloatTensor
-    audio_norm: torch.FloatTensor
-    speaker_id: typing.Optional[torch.LongTensor] = None
+#             all_loss_g.append(loss_g.item())
 
+#     if all_loss_g:
+#         avg_loss_g = sum(all_loss_g) / len(all_loss_g)
+#         return avg_loss_g
 
-class PhonemeIdsAndMelsDataset(Dataset):
-    def __init__(
-        self,
-        config: TrainingConfig,
-        utt_phoneme_ids: typing.Mapping[str, typing.Sequence[int]],
-        audio_dir: typing.Union[str, Path],
-        utt_speaker_ids: typing.Optional[typing.Mapping[str, int]] = None,
-        cache_dir: typing.Optional[typing.Union[str, Path]] = None,
-    ):
-        super().__init__()
-
-        self.config = config
-        self.audio_dir = Path(audio_dir)
-        self.utterances: typing.List[Utterance] = []
-
-        self.temp_dir: typing.Optional[tempfile.TemporaryDirectory] = None
-
-        if cache_dir is None:
-            self.temp_dir = tempfile.TemporaryDirectory(prefix="vits_train")
-            self.cache_dir = Path(self.temp_dir.name)
-        else:
-            self.cache_dir = Path(cache_dir)
-
-        if utt_speaker_ids is None:
-            utt_speaker_ids = {}
-
-        for utt_id, phoneme_ids in utt_phoneme_ids.items():
-            audio_path = self.audio_dir / utt_id
-            if not audio_path.is_file():
-                # Try WAV extension
-                audio_path = self.audio_dir / f"{utt_id}.wav"
-
-            if audio_path.is_file():
-                self.utterances.append(
-                    Utterance(
-                        id=utt_id,
-                        phoneme_ids=phoneme_ids,
-                        audio_path=audio_path,
-                        speaker_id=utt_speaker_ids.get(utt_id),
-                    )
-                )
-            else:
-                _LOGGER.warning("Missing audio file: %s", audio_path)
-
-    def __getitem__(self, index):
-        utterance = self.utterances[index]
-
-        audio_norm_path = (
-            self.cache_dir / utterance.audio_path.with_suffix(".norm.pt").name
-        )
-        if audio_norm_path.is_file():
-            audio_norm = torch.load(str(audio_norm_path))
-        else:
-            # Load audio and resample
-            audio, _sample_rate = librosa.load(
-                str(utterance.audio_path), sr=self.config.audio.sample_rate
-            )
-
-            audio_norm = torch.FloatTensor(
-                audio / self.config.audio.max_wav_value
-            ).unsqueeze(0)
-
-            torch.save(audio_norm, str(audio_norm_path))
-
-        spectrogram_path = (
-            self.cache_dir / utterance.audio_path.with_suffix(".spec.pt").name
-        )
-        if spectrogram_path.is_file():
-            spectrogram = torch.load(str(spectrogram_path))
-        else:
-            spectrogram = spectrogram_torch(
-                y=audio_norm,
-                n_fft=self.config.audio.filter_length,
-                sampling_rate=self.config.audio.sample_rate,
-                hop_size=self.config.audio.hop_length,
-                win_size=self.config.audio.win_length,
-                center=False,
-            ).squeeze(0)
-
-            torch.save(spectrogram, str(spectrogram_path))
-
-        speaker_id = None
-        if utterance.speaker_id is not None:
-            speaker_id = torch.LongTensor([utterance.speaker_id])
-
-        return UtteranceTensors(
-            id=utterance.id,
-            phoneme_ids=torch.LongTensor(utterance.phoneme_ids),
-            audio_norm=audio_norm,
-            spectrogram=spectrogram,
-            speaker_id=speaker_id,
-        )
-
-    def __len__(self):
-        return len(self.utterances)
-
-
-class UtteranceCollate:
-    def __call__(self, utterances: typing.Sequence[UtteranceTensors]) -> Batch:
-        num_utterances = len(utterances)
-        assert num_utterances > 0, "No utterances"
-
-        max_phonemes_length = 0
-        max_spec_length = 0
-        max_audio_length = 0
-
-        num_mels = 0
-        multispeaker = False
-
-        # Determine lengths
-        for utt_idx, utt in enumerate(utterances):
-            assert utt.spectrogram is not None
-            assert utt.audio_norm is not None
-
-            phoneme_length = utt.phoneme_ids.size(0)
-            spec_length = utt.spectrogram.size(1)
-            audio_length = utt.audio_norm.size(1)
-
-            max_phonemes_length = max(max_phonemes_length, phoneme_length)
-            max_spec_length = max(max_spec_length, spec_length)
-            max_audio_length = max(max_audio_length, audio_length)
-
-            num_mels = utt.spectrogram.size(0)
-            if utt.speaker_id is not None:
-                multispeaker = True
-
-        # Create padded tensors
-        phonemes_padded = torch.LongTensor(num_utterances, max_phonemes_length)
-        spec_padded = torch.FloatTensor(num_utterances, num_mels, max_spec_length)
-        audio_padded = torch.FloatTensor(num_utterances, 1, max_audio_length)
-
-        phonemes_padded.zero_()
-        spec_padded.zero_()
-        audio_padded.zero_()
-
-        phoneme_lengths = torch.LongTensor(num_utterances)
-        spec_lengths = torch.LongTensor(num_utterances)
-        audio_lengths = torch.LongTensor(num_utterances)
-
-        speaker_ids: typing.Optional[torch.LongTensor] = None
-        if multispeaker:
-            speaker_ids = torch.LongTensor(num_utterances)
-
-        # Sort by decreasing spectrogram length
-        sorted_utterances = sorted(
-            utterances, key=lambda u: u.spectrogram.size(1), reverse=True
-        )
-        for utt_idx, utt in enumerate(sorted_utterances):
-            phoneme_length = utt.phoneme_ids.size(0)
-            spec_length = utt.spectrogram.size(1)
-            audio_length = utt.audio_norm.size(1)
-
-            phonemes_padded[utt_idx, :phoneme_length] = utt.phoneme_ids
-            phoneme_lengths[utt_idx] = phoneme_length
-
-            spec_padded[utt_idx, :, :spec_length] = utt.spectrogram
-            spec_lengths[utt_idx] = spec_length
-
-            audio_padded[utt_idx, :, :audio_length] = utt.audio_norm
-            audio_lengths[utt_idx] = audio_length
-
-            if utt.speaker_id is not None:
-                assert speaker_ids is not None
-                speaker_ids[utt_idx] = utt.speaker_id
-
-        return Batch(
-            phoneme_ids=phonemes_padded,
-            phoneme_lengths=phoneme_lengths,
-            spectrograms=spec_padded,
-            spectrogram_lengths=spec_lengths,
-            audios=audio_padded,
-            audio_lengths=audio_lengths,
-            speaker_ids=speaker_ids,
-        )
-
-
-# -----------------------------------------------------------------------------
-
-
-def main():
-    logging.basicConfig(level=logging.DEBUG)
-
-    train_path = "data/ljspeech/ljs_audio_text_train_filelist.txt.cleaned"
-    val_path = "data/ljspeech/ljs_audio_text_val_filelist.txt.cleaned"
-    test_path = "data/ljspeech/ljs_audio_text_test_filelist.txt.cleaned"
-
-    config_path = "local/ljspeech/config.json"
-    with open(config_path, "r", encoding="utf-8") as config_file:
-        config = TrainingConfig.load(config_file)
-
-    phoneme_to_id = {}
-    phonemes_path = "local/ljspeech/phonemes.txt"
-    with open(phonemes_path, "r", encoding="utf-8") as phonemes_file:
-        for line in phonemes_file:
-            line = line.strip("\r\n")
-            if (not line) or line.startswith("#"):
-                continue
-
-            phoneme_id, phoneme = re.split(r"[ \t]", line, maxsplit=1)
-
-            # Avoid overwriting duplicates
-            if phoneme not in phoneme_to_id:
-                phoneme_id = int(phoneme_id)
-                phoneme_to_id[phoneme] = phoneme_id
-
-    utt_phoneme_ids = {}
-    train_ids = []
-    val_ids = []
-    test_ids = []
-
-    for ids, csv_path in [
-        (train_ids, train_path),
-        (val_ids, val_path),
-        (test_ids, test_path),
-    ]:
-        with open(csv_path, "r", encoding="utf-8") as csv_file:
-            reader = csv.reader(csv_file, delimiter="|")
-            for row_idx, row in enumerate(reader):
-                # TODO: speaker
-                assert len(row) > 1, f"{row} in {csv_path}:{row_idx+1}"
-                utt_id, phonemes = row[0], row[1]
-                phoneme_ids = [phoneme_to_id[p] for p in phonemes if p in phoneme_to_id]
-
-                assert phoneme_ids, utt_id
-                phoneme_ids = intersperse(phoneme_ids, 0)
-                utt_phoneme_ids[utt_id] = phoneme_ids
-                ids.append(utt_id)
-
-    model = VITSTraining(
-        config=config,
-        utt_phoneme_ids=utt_phoneme_ids,
-        audio_dir="data/ljspeech/wavs",
-        train_ids=train_ids,
-        val_ids=val_ids,
-        test_ids=test_ids,
-        cache_dir="data/ljspeech/wavs",
-    )
-    trainer = pl.Trainer(gpus=2, precision=16, accelerator="ddp")
-    trainer.fit(model)
-
-
-if __name__ == "__main__":
-    main()
+#     return 0.0
