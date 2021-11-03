@@ -10,7 +10,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from vits_train import setup_model
+from vits_train import setup_model, setup_discriminator
 from vits_train.checkpoint import Checkpoint, save_checkpoint
 from vits_train.commons import clip_grad_value_, slice_segments
 from vits_train.config import TrainingConfig
@@ -50,10 +50,7 @@ def train(
     assert model_g is not None
 
     if model_d is None:
-        model_d = MultiPeriodDiscriminator(
-            use_spectral_norm=config.model.use_spectral_norm
-        )
-        model_d.cuda()
+        model_d = setup_discriminator(config)
 
     assert model_d is not None
 
@@ -177,7 +174,8 @@ def train(
 
         if ((epoch % checkpoint_epochs) == 0) and (rank == 0):
             # Save checkpoint
-            checkpoint_path = model_dir / f"checkpoint_{global_step}.pth"
+            # checkpoint_path = model_dir / f"checkpoint_{global_step}.pth"
+            checkpoint_path = model_dir / f"best_model.pth"
             _LOGGER.debug("Saving checkpoint to %s", checkpoint_path)
             save_checkpoint(
                 Checkpoint(

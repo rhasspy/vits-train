@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.optim
 
-from vits_train import setup_model
+from vits_train import setup_model, setup_discriminator
 from vits_train.config import TrainingConfig
 from vits_train.models import MultiPeriodDiscriminator, SynthesizerTrn
 
@@ -110,7 +110,10 @@ def load_checkpoint(
 
     _load_state_dict(model_g, checkpoint_dict, "model_g")
 
-    if load_discrimiator and (model_d is not None):
+    if load_discrimiator:
+        if model_d is None:
+            model_d = setup_discriminator(config, use_cuda=use_cuda)
+
         _load_state_dict(model_d, checkpoint_dict, "model_d")
 
     # Load optimizer states

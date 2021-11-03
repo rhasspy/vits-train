@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from vits_train.config import TrainingConfig
-from vits_train.models import SynthesizerTrn
+from vits_train.models import SynthesizerTrn, MultiPeriodDiscriminator
 
 
 def setup_model(config: TrainingConfig, use_cuda: bool = True) -> SynthesizerTrn:
@@ -29,6 +29,16 @@ def setup_model(config: TrainingConfig, use_cuda: bool = True) -> SynthesizerTrn
         use_sdp=config.model.use_sdp,
     )
 
+    if use_cuda:
+        model.cuda()
+
+    return model
+
+
+def setup_discriminator(
+    config: TrainingConfig, use_cuda: bool = True
+) -> MultiPeriodDiscriminator:
+    model = MultiPeriodDiscriminator(use_spectral_norm=config.model.use_spectral_norm)
     if use_cuda:
         model.cuda()
 

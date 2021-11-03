@@ -9,18 +9,22 @@ from pathlib import Path
 
 import torch
 
-from vits_train import setup_model
 from vits_train.commons import intersperse
 from vits_train.config import TrainingConfig
 from vits_train.wavfile import write as write_wav
+from vits_train.checkpoint import load_checkpoint
+from vits_train.utils import audio_float_to_int16
 
 _LOGGER = logging.getLogger("vits_train.infer")
 
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(prog="glow-tts-train.infer")
-    parser.add_argument("model_dir", help="Path to model directory")
+    parser = argparse.ArgumentParser(prog="vits-train.infer")
+    parser.add_argument("--model-dir", help="Path to model directory")
+    parser.add_argument(
+        "--checkpoint", help="Path to model checkpoint (default: best_model.pth)"
+    )
     parser.add_argument(
         "--output-dir",
         help="Directory to write WAV file(s) (default: current directory)",
@@ -53,7 +57,10 @@ def main():
     # -------------------------------------------------------------------------
 
     # Convert to paths
-    args.model_dir = Path(args.model_dir)
+    if args.model_dir:
+        args.model_dir = Path(args.model_dir)
+    else:
+        args.model_dir = Path.cwd()
 
     if args.output_dir:
         args.output_dir = Path(args.output_dir)
@@ -96,32 +103,23 @@ def main():
         ), f"Model has {config.model.num_symbols}, but phonemes.txt has {num_phonemes}"
 
     # Load checkpoint
-    model = setup_model(config)
     start_time = time.perf_counter()
 
     # Checkpoint
-    checkpoint_path = args.model_dir / "generator.pth"
+    if args.checkpoint:
+        checkpoint_path = Path(args.checkpoint)
+    else:
+        checkpoint_path = args.model_dir / "best_model.pth"
+
     _LOGGER.debug("Loading checkpoint from %s", checkpoint_path)
-    checkpoint_dict = torch.load(str(checkpoint_path), map_location="cpu")
-
-    if hasattr(model, "module"):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
-
-    saved_state_dict = checkpoint_dict["model"]
-    new_state_dict = {}
-    for key, value in state_dict.items():
-        if key in saved_state_dict:
-            new_state_dict[key] = saved_state_dict[key]
-        else:
-            _LOGGER.warning("%s is not in model state dict", key)
-            new_state_dict[key] = value
-
-    if hasattr(model, "module"):
-        model.module.load_state_dict(new_state_dict)
-    else:
-        model.load_state_dict(new_state_dict)
+    model = load_checkpoint(
+        str(checkpoint_path),
+        config=config,
+        load_discrimiator=False,
+        load_optimizers=False,
+        load_schedulers=False,
+        use_cuda=args.cuda,
+    ).model_g
 
     end_time = time.perf_counter()
 
@@ -170,7 +168,7 @@ def main():
                 # Map phonemes to ids
                 assert phoneme_to_id, "No phonemes were loaded"
                 phoneme_ids = [phoneme_to_id[p] for p in line if p in phoneme_to_id]
-                phoneme_ids = intersperse(phoneme_ids, 0)
+                # phoneme_ids = intersperse(phoneme_ids, 0)
             else:
                 # Phoneme ids as p1 p2 p3...
                 phoneme_ids = [int(p) for p in line.split()]
@@ -212,6 +210,7 @@ def main():
                     .float()
                     .numpy()
                 )
+                audio = audio_float_to_int16(audio)
                 end_time = time.perf_counter()
 
                 _LOGGER.debug(

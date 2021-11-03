@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from vits_train import setup_model
+from vits_train import setup_model, setup_discriminator
 from vits_train.checkpoint import load_checkpoint
 from vits_train.config import TrainingConfig
 from vits_train.dataset import PhonemeIdsAndMelsDataset, UtteranceCollate, load_dataset
@@ -75,6 +75,9 @@ def main():
         help="Directory to store cached audio/spectrograms (default: <output>/cache",
     )
     parser.add_argument(
+        "--local_rank", type=int, default=0, help="Rank for multi-GPU training"
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to the console"
     )
     args = parser.parse_args()
@@ -90,7 +93,7 @@ def main():
 
     assert torch.cuda.is_available(), "GPU is required for training"
 
-    local_rank = os.environ.get("LOCAL_RANK")
+    local_rank = os.environ.get("LOCAL_RANK", args.local_rank)
     if local_rank is not None:
         local_rank = int(local_rank)
 
@@ -249,12 +252,22 @@ def main():
             config.best_loss,
         )
     else:
-        # Fresh model
-        model = setup_model(config)
+        # Fresh models
+        model_g = setup_model(config)
+        model_d = setup_discriminator(config)
 
     if is_distributed:
-        model = DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank
+        model_g = DistributedDataParallel(
+            model_g,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
+        model_d = DistributedDataParallel(
+            model_d,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
         )
 
     # Train
