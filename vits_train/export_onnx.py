@@ -5,12 +5,12 @@ from pathlib import Path
 
 import torch
 
-from .checkpoint import load_checkpoint
-from .config import TrainingConfig
+from vits_train.checkpoint import load_checkpoint
+from vits_train.config import TrainingConfig
 
 _LOGGER = logging.getLogger("vits_train.export_onnx")
 
-OPSET_VERSION = 12
+OPSET_VERSION = 11
 
 # -----------------------------------------------------------------------------
 
@@ -67,7 +67,23 @@ def main():
 
     # Inference only
     model_g.eval()
-    model_g.forward = model_g.infer
+    old_forward = model_g.infer
+
+    def infer_forward(text, text_lengths, scales):
+        noise_scale = scales[0]
+        length_scale = scales[1]
+        noise_scale_w = scales[2]
+        audio, *_ = old_forward(
+            text,
+            text_lengths,
+            noise_scale=noise_scale,
+            length_scale=length_scale,
+            noise_scale_w=noise_scale_w,
+        )
+
+        return audio
+
+    model_g.forward = infer_forward
 
     # Create output directory
     args.output.mkdir(parents=True, exist_ok=True)
@@ -83,7 +99,7 @@ def main():
     sequence_lengths = torch.IntTensor([sequences.size(1)]).long()
 
     # noise, noise_w, length
-    scales = torch.FloatTensor([0.667, 0.8, 1.0])
+    scales = torch.FloatTensor([0.667, 1.0, 0.8])
 
     dummy_input = (sequences, sequence_lengths, scales)
 
@@ -93,8 +109,7 @@ def main():
         dummy_input,
         str(args.output / "generator.onnx"),
         opset_version=OPSET_VERSION,
-        do_constant_folding=False,
-        enable_onnx_checker=True,
+        verbose=True,
         input_names=["input", "input_lengths", "scales"],
         output_names=["output"],
         dynamic_axes={
