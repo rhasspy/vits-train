@@ -10,7 +10,7 @@ from vits_train.config import TrainingConfig
 
 _LOGGER = logging.getLogger("vits_train.export_onnx")
 
-OPSET_VERSION = 11
+OPSET_VERSION = 13
 
 # -----------------------------------------------------------------------------
 
@@ -55,7 +55,7 @@ def main():
     model_g = load_checkpoint(
         args.checkpoint,
         config=config,
-        load_discrimiator=True,
+        load_discrimiator=False,
         load_optimizers=False,
         load_schedulers=False,
         use_cuda=False,
@@ -67,6 +67,10 @@ def main():
 
     # Inference only
     model_g.eval()
+
+    with torch.no_grad():
+        model_g.dec.remove_weight_norm()
+
     old_forward = model_g.infer
 
     def infer_forward(text, text_lengths, scales):
@@ -89,7 +93,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
 
     # Write config
-    with open(args.output / "config.json", "w") as config_file:
+    with open(args.output / "config.json", "w", encoding="utf-8") as config_file:
         config.save(config_file)
 
     # Create dummy input
@@ -105,11 +109,10 @@ def main():
 
     # Export
     torch.onnx.export(
-        model_g,
-        dummy_input,
-        str(args.output / "generator.onnx"),
+        model=model_g,
+        args=dummy_input,
+        f=str(args.output / "generator.onnx"),
         opset_version=OPSET_VERSION,
-        verbose=True,
         input_names=["input", "input_lengths", "scales"],
         output_names=["output"],
         dynamic_axes={
@@ -118,6 +121,23 @@ def main():
             "output": {0: "batch_size", 1: "time"},
         },
     )
+    # (args.output / "generator.txt").write_text(
+    #     torch.onnx.export_to_pretty_string(
+    #         model=model_g,
+    #         args=dummy_input,
+    #         f=str(args.output / "generator.onnx"),
+    #         opset_version=OPSET_VERSION,
+    #         input_names=["input", "input_lengths", "scales"],
+    #         output_names=["output"],
+    #         dynamic_axes={
+    #             "input": {0: "batch_size", 1: "phonemes"},
+    #             "input_lengths": {0: "batch_size"},
+    #             "output": {0: "batch_size", 1: "time"},
+    #         },
+    #         google_printer=True,
+    #         add_node_names=True,
+    #     )
+    # )
 
     _LOGGER.info("Exported model to %s", args.output)
 

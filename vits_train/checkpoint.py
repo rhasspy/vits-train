@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.optim
 
-from vits_train import setup_model, setup_discriminator
+from vits_train import setup_discriminator, setup_model
 from vits_train.config import TrainingConfig
 from vits_train.models import MultiPeriodDiscriminator, SynthesizerTrn
 
@@ -41,21 +41,23 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_path: Path):
     else:
         state_dict_g = model_g.state_dict()
 
-    model_d = checkpoint.model_d
-
-    if hasattr(model_d, "module"):
-        state_dict_d = model_d.module.state_dict()  # type: ignore
-    else:
-        state_dict_d = model_d.state_dict()
-
     checkpoint_dict = {
         "model_g": state_dict_g,
-        "model_d": state_dict_d,
         "global_step": checkpoint.global_step,
         "epoch": checkpoint.epoch,
         "version": checkpoint.version,
         "best_loss": checkpoint.best_loss,
     }
+
+    model_d = checkpoint.model_d
+
+    if model_d is not None:
+        if hasattr(model_d, "module"):
+            state_dict_d = model_d.module.state_dict()  # type: ignore
+        else:
+            state_dict_d = model_d.state_dict()
+
+        checkpoint_dict["model_d"] = state_dict_d
 
     optimizer_g = checkpoint.optimizer_g
 

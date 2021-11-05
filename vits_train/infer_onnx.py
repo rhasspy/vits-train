@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 import onnxruntime
 
 from vits_train.config import TrainingConfig

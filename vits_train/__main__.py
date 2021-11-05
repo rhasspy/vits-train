@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from vits_train import setup_model, setup_discriminator
+from vits_train import setup_discriminator, setup_model
 from vits_train.checkpoint import load_checkpoint
 from vits_train.config import TrainingConfig
 from vits_train.dataset import PhonemeIdsAndMelsDataset, UtteranceCollate, load_dataset

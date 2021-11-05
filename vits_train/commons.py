@@ -44,7 +44,7 @@ def rand_gumbel(shape):
 
 
 def rand_gumbel_like(x):
-    g = rand_gumbel(x.size()).to(dtype=x.dtype, device=x.device)
+    g = rand_gumbel(x.size()).type_as(x)
     return g
 
 
@@ -62,7 +62,7 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
     if x_lengths is None:
         x_lengths = t
     ids_str_max = x_lengths - segment_size + 1
-    ids_str = (torch.rand([b]).to(device=x.device) * ids_str_max).to(dtype=torch.long)
+    ids_str = (torch.rand([b]).to(device=x.device) * ids_str_max).long()
     ret = slice_segments(x, ids_str, segment_size)
     return ret, ids_str
 
@@ -86,13 +86,13 @@ def get_timing_signal_1d(length, channels, min_timescale=1.0, max_timescale=1.0e
 def add_timing_signal_1d(x, min_timescale=1.0, max_timescale=1.0e4):
     b, channels, length = x.size()
     signal = get_timing_signal_1d(length, channels, min_timescale, max_timescale)
-    return x + signal.to(dtype=x.dtype, device=x.device)
+    return x + signal.type_as(x)
 
 
 def cat_timing_signal_1d(x, min_timescale=1.0, max_timescale=1.0e4, axis=1):
     b, channels, length = x.size()
     signal = get_timing_signal_1d(length, channels, min_timescale, max_timescale)
-    return torch.cat([x, signal.to(dtype=x.dtype, device=x.device)], axis)
+    return torch.cat([x, signal.type_as(x)], axis)
 
 
 def subsequent_mask(length):
@@ -110,20 +110,12 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
     return acts
 
 
-def convert_pad_shape(pad_shape):
-    l = pad_shape[::-1]
-    pad_shape = [item for sublist in l for item in sublist]
-    return pad_shape
-
-
 def shift_1d(x):
     x = F.pad(x, convert_pad_shape([[0, 0], [0, 0], [1, 0]]))[:, :, :-1]
     return x
 
 
-def sequence_mask(length, max_length=None):
-    if max_length is None:
-        max_length = length.max()
+def sequence_mask(length, max_length):
     x = torch.arange(max_length, dtype=length.dtype, device=length.device)
     return x.unsqueeze(0) < length.unsqueeze(1)
 
