@@ -162,14 +162,8 @@ def main():
         len(args.dataset) <= num_speakers
     ), "More datasets than speakers in model config"
 
-    if len(args.dataset) < num_speakers:
-        _LOGGER.warning(
-            "Model has %s speaker(s), but only %s dataset(s) were provided",
-            num_speakers,
-            len(args.dataset),
-        )
-
     datasets = []
+    speaker_id_map: typing.Dict[str, int] = {}
     for dataset_name, metadata_dir, audio_dir in args.dataset:
         metadata_dir = Path(metadata_dir)
         audio_dir = Path(audio_dir)
@@ -180,6 +174,7 @@ def main():
                 dataset_name=dataset_name,
                 metadata_dir=metadata_dir,
                 audio_dir=audio_dir,
+                speaker_id_map=speaker_id_map,
             )
         )
 

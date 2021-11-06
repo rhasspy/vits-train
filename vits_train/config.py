@@ -233,6 +233,10 @@ class ModelConfig(DataClassJsonMixin):
     gin_channels: int = 256
     use_sdp: bool = True  # StochasticDurationPredictor
 
+    @property
+    def is_multispeaker(self) -> bool:
+        return self.n_speakers > 1
+
 
 @dataclass
 class TrainingConfig(DataClassJsonMixin):
