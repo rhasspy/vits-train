@@ -10,7 +10,7 @@ from vits_train.config import TrainingConfig
 
 _LOGGER = logging.getLogger("vits_train.export_onnx")
 
-OPSET_VERSION = 11
+OPSET_VERSION = 13
 
 # -----------------------------------------------------------------------------
 
@@ -118,6 +118,24 @@ def main():
             "output": {0: "batch_size", 1: "time"},
         },
     )
+
+    # (args.output / "generator.txt").write_text(
+    #     torch.onnx.export_to_pretty_string(
+    #         model=model_g,
+    #         args=dummy_input,
+    #         f=str(args.output / "generator.onnx"),
+    #         opset_version=OPSET_VERSION,
+    #         input_names=["input", "input_lengths", "scales"],
+    #         output_names=["output"],
+    #         dynamic_axes={
+    #             "input": {0: "batch_size", 1: "phonemes"},
+    #             "input_lengths": {0: "batch_size"},
+    #             "output": {0: "batch_size", 1: "time"},
+    #         },
+    #         google_printer=True,
+    #         add_node_names=True,
+    #     )
+    # )
 
     _LOGGER.info("Exported model to %s", args.output)
 
