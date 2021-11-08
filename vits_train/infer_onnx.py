@@ -7,13 +7,11 @@ import time
 from pathlib import Path
 
 import numpy as np
-
 import onnxruntime
 
 from vits_train.config import TrainingConfig
 from vits_train.utils import audio_float_to_int16
 from vits_train.wavfile import write as write_wav
-from vits_train.utils import audio_float_to_int16
 
 _LOGGER = logging.getLogger("vits_train.infer_onnx")
 

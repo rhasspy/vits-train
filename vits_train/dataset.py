@@ -1,7 +1,6 @@
 import csv
 import logging
 import math
-import re
 import shutil
 import tempfile
 import typing
@@ -11,6 +10,7 @@ from pathlib import Path
 
 import librosa
 import torch
+from phonemes2ids import phonemes2ids
 from torch.utils.data import Dataset
 
 from vits_train.config import TrainingConfig
@@ -429,27 +429,9 @@ def load_dataset(
             f"Missing {split}_ids.csv or {split}_phonemes.csv in {metadata_dir}"
         )
 
-    # Load phonemes
-    phoneme_to_id = {}
-    phonemes_path = metadata_dir / "phonemes.txt"
-
-    _LOGGER.debug("Loading phonemes from %s", phonemes_path)
-    with open(phonemes_path, "r", encoding="utf-8") as phonemes_file:
-        for line in phonemes_file:
-            line = line.strip("\r\n")
-            if (not line) or line.startswith("#"):
-                continue
-
-            phoneme_id, phoneme = re.split(r"[ \t]", line, maxsplit=1)
-
-            # Avoid overwriting duplicates
-            if phoneme not in phoneme_to_id:
-                phoneme_id = int(phoneme_id)
-                phoneme_to_id[phoneme] = phoneme_id
-
-    id_to_phoneme = {i: p for p, i in phoneme_to_id.items()}
-
     # Load utterances
+    phoneme_to_id = config.phonemes.phoneme_to_id
+
     utt_phoneme_ids: typing.Dict[str, str] = {}
     utt_speaker_ids: typing.Dict[str, int] = {}
 
@@ -481,14 +463,33 @@ def load_dataset(
                     utt_speaker_ids[utt_id] = speaker_id_map[speaker]
 
                 if is_phonemes:
-                    # TODO: Map phonemes with phonemes2ids
-                    raise NotImplementedError(csv_path)
-                    # phoneme_ids = [phoneme_to_id[p] for p in phonemes if p in phoneme_to_id]
-                    # phoneme_ids = intersperse(phoneme_ids, 0)
+                    # Map phonemes with phonemes2ids
+                    assert phoneme_to_id, "No phoneme to id map (missing phonemes.txt?)"
+                    word_phonemes = config.phonemes.split_word_phonemes(phonemes_or_ids)
+                    phoneme_ids = phonemes2ids(
+                        word_phonemes=word_phonemes,
+                        phoneme_to_id=phoneme_to_id,
+                        pad=config.phonemes.pad,
+                        bos=config.phonemes.bos,
+                        eos=config.phonemes.eos,
+                        blank=config.phonemes.blank,
+                        blank_word=config.phonemes.blank_word,
+                        blank_between=config.phonemes.blank_between,
+                        blank_at_start=config.phonemes.blank_at_start,
+                        blank_at_end=config.phonemes.blank_at_end,
+                        simple_punctuation=config.phonemes.simple_punctuation,
+                        punctuation_map=config.phonemes.punctuation_map,
+                        separate=config.phonemes.separate,
+                        separate_graphemes=config.phonemes.separate_graphemes,
+                        separate_tones=config.phonemes.separate_tones,
+                        tone_before=config.phonemes.tone_before,
+                    )
                 else:
                     phoneme_ids = [int(p_id) for p_id in phonemes_or_ids.split()]
                     phoneme_ids = [
-                        p_id for p_id in phoneme_ids if p_id in id_to_phoneme
+                        p_id
+                        for p_id in phoneme_ids
+                        if 0 <= p_id < config.model.num_symbols
                     ]
 
                 if phoneme_ids:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from vits_train.config import TrainingConfig
-from vits_train.models import SynthesizerTrn, MultiPeriodDiscriminator
+from vits_train.models import MultiPeriodDiscriminator, SynthesizerTrn
 
 
 def setup_model(config: TrainingConfig, use_cuda: bool = True) -> SynthesizerTrn:

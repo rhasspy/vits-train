@@ -1,9 +1,10 @@
-import torch
 import numpy as np
+import torch
 
 
 def to_gpu(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous().cuda(non_blocking=True)
+
 
 def audio_float_to_int16(
     audio: np.ndarray, max_wav_value: float = 32767.0

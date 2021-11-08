@@ -10,7 +10,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from vits_train import setup_model, setup_discriminator
+from vits_train import setup_discriminator, setup_model
 from vits_train.checkpoint import Checkpoint, save_checkpoint
 from vits_train.commons import clip_grad_value_, slice_segments
 from vits_train.config import TrainingConfig
@@ -226,7 +226,7 @@ def train_step(
 
     for batch_idx, batch in enumerate(train_loader):
         batch = typing.cast(Batch, batch)
-        x, x_lengths, y, _y_lengths, spec, spec_lengths, speaker_ids = (
+        x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
             to_gpu(batch.phoneme_ids),
             to_gpu(batch.phoneme_lengths),
             to_gpu(batch.audios),
@@ -303,7 +303,6 @@ def train_step(
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, _losses_gen = generator_loss(y_d_hat_g)
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-
 
         # Generator loss
         scaler.scale(loss_gen_all).backward()

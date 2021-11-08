@@ -1,8 +1,6 @@
 import math
 
-import numpy as np
 import torch
-from torch import nn
 from torch.nn import functional as F
 
 
@@ -14,12 +12,6 @@ def init_weights(m, mean=0.0, std=0.01):
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size * dilation - dilation) / 2)
-
-
-def convert_pad_shape(pad_shape):
-    l = pad_shape[::-1]
-    pad_shape = [item for sublist in l for item in sublist]
-    return pad_shape
 
 
 def intersperse(lst, item):
@@ -110,17 +102,6 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
     return acts
 
 
-# def convert_pad_shape(pad_shape):
-#     l = pad_shape[::-1]
-#     pad_shape = [item for sublist in l for item in sublist]
-#     return pad_shape
-
-
-def shift_1d(x):
-    x = F.pad(x, convert_pad_shape([[0, 0], [0, 0], [1, 0]]))[:, :, :-1]
-    return x
-
-
 def sequence_mask(length, max_length=None):
     if max_length is None:
         max_length = length.max()
@@ -133,15 +114,13 @@ def generate_path(duration, mask):
   duration: [b, 1, t_x]
   mask: [b, 1, t_y, t_x]
   """
-    device = duration.device
-
     b, _, t_y, t_x = mask.shape
     cum_duration = torch.cumsum(duration, -1)
 
     cum_duration_flat = cum_duration.view(b * t_x)
-    path = sequence_mask(cum_duration_flat, t_y).to(mask.dtype)
+    path = sequence_mask(cum_duration_flat, t_y).type_as(mask)
     path = path.view(b, t_x, t_y)
-    path = path - F.pad(path, convert_pad_shape([[0, 0], [1, 0], [0, 0]]))[:, :-1]
+    path = path - F.pad(path, (0, 0, 1, 0, 0, 0))[:, :-1]
     path = path.unsqueeze(1).transpose(2, 3) * mask
     return path
 

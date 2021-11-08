@@ -8,11 +8,12 @@ from pathlib import Path
 
 import torch
 import torch.multiprocessing
+from phonemes2ids import load_phoneme_ids
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from vits_train import setup_model, setup_discriminator
+from vits_train import setup_discriminator, setup_model
 from vits_train.checkpoint import load_checkpoint
 from vits_train.config import TrainingConfig
 from vits_train.dataset import PhonemeIdsAndMelsDataset, UtteranceCollate, load_dataset
@@ -138,6 +139,13 @@ def main():
         config = TrainingConfig.load_and_merge(config, args.config)
 
     config.git_commit = args.git_commit
+
+    if not config.phonemes.phoneme_to_id:
+        phonemes_path = args.output / "phonemes.txt"
+        if phonemes_path.is_file():
+            _LOGGER.debug("Loading phonemes from %s", phonemes_path)
+            with open(phonemes_path, "r", encoding="utf-8") as phonemes_file:
+                config.phonemes.phoneme_to_id = load_phoneme_ids(phonemes_file)
 
     _LOGGER.debug(config)
 
