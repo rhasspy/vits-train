@@ -226,7 +226,7 @@ def train_step(
 
     for batch_idx, batch in enumerate(train_loader):
         batch = typing.cast(Batch, batch)
-        x, x_lengths, y, _y_lengths, spec, spec_lengths, speaker_ids = (
+        x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
             to_gpu(batch.phoneme_ids),
             to_gpu(batch.phoneme_lengths),
             to_gpu(batch.audios),

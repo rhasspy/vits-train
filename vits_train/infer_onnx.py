@@ -11,6 +11,7 @@ import onnxruntime
 
 from vits_train.config import TrainingConfig
 from vits_train.utils import audio_float_to_int16
+from vits_train.wavfile import write as write_wav
 
 _LOGGER = logging.getLogger("vits_train.infer_onnx")
 
@@ -106,7 +107,7 @@ def main():
             text = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
             text_lengths = np.array([text.shape[1]], dtype=np.int64)
             scales = np.array(
-                [args.noise_scale, args.noise_scale_w, args.length_scale],
+                [args.noise_scale, args.length_scale, args.noise_scale_w],
                 dtype=np.float32,
             )
 
@@ -114,15 +115,22 @@ def main():
             start_time = time.perf_counter()
             audio = model.run(
                 None, {"input": text, "input_lengths": text_lengths, "scales": scales}
-            )[0].squeeze(0)
+            )[0].squeeze()
             audio = audio_float_to_int16(audio)
             end_time = time.perf_counter()
 
+            audio_duration_sec = audio.shape[-1] / config.audio.sample_rate
+            infer_sec = end_time - start_time
+            real_time_factor = (
+                infer_sec / audio_duration_sec if audio_duration_sec > 0 else 0.0
+            )
+
             _LOGGER.debug(
-                "Generated audio in %s second(s) (%s, shape=%s)",
-                end_time - start_time,
+                "Real-time factor for %s: %0.2f (infer=%0.2f sec, audio=%0.2f sec)",
                 utt_id,
-                list(audio.shape),
+                real_time_factor,
+                infer_sec,
+                audio_duration_sec,
             )
 
             output_file_name = utt_id

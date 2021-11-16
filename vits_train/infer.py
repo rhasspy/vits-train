@@ -10,7 +10,6 @@ from pathlib import Path
 import torch
 
 from vits_train.checkpoint import load_checkpoint
-from vits_train.commons import intersperse
 from vits_train.config import TrainingConfig
 from vits_train.utils import audio_float_to_int16
 from vits_train.wavfile import write as write_wav
@@ -213,17 +212,11 @@ def main():
                 audio = audio_float_to_int16(audio)
                 end_time = time.perf_counter()
 
-                audio_duration_sec = audio.shape[-1] / config.audio.sample_rate
-                infer_sec = end_time - start_time
-                real_time_factor = (
-                    infer_sec / audio_duration_sec if audio_duration_sec > 0 else 0.0
-                )
-
                 _LOGGER.debug(
-                    "Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)",
-                    real_time_factor,
-                    infer_sec,
-                    audio_duration_sec,
+                    "Generated audio in %s second(s) (%s, shape=%s)",
+                    end_time - start_time,
+                    utt_id,
+                    list(audio.shape),
                 )
 
                 output_file_name = utt_id

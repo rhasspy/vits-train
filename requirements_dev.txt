@@ -1,0 +1,5 @@
+black==19.10b0
+coverage==5.0.4
+flake8==3.7.9
+mypy==0.910
+pylint==2.10.2

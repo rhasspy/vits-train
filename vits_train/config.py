@@ -8,6 +8,7 @@ from pathlib import Path
 import librosa
 import numpy as np
 from dataclasses_json import DataClassJsonMixin
+from phonemes2ids import STRESS, BlankBetween
 
 
 @dataclass
@@ -233,6 +234,42 @@ class ModelConfig(DataClassJsonMixin):
     gin_channels: int = 256
     use_sdp: bool = True  # StochasticDurationPredictor
 
+    @property
+    def is_multispeaker(self) -> bool:
+        return self.n_speakers > 1
+
+
+@dataclass
+class PhonemesConfig(DataClassJsonMixin):
+    phoneme_separator: str = " "
+    """Separator between individual phonemes in CSV input"""
+
+    word_separator: str = "#"
+    """Separator between word phonemes in CSV input (must not match phoneme_separator)"""
+
+    phoneme_to_id: typing.Optional[typing.Mapping[str, int]] = None
+    pad: typing.Optional[str] = "_"
+    bos: typing.Optional[str] = None
+    eos: typing.Optional[str] = None
+    blank: typing.Optional[str] = "#"
+    blank_word: typing.Optional[str] = None
+    blank_between: typing.Union[str, BlankBetween] = BlankBetween.WORDS
+    blank_at_start: bool = True
+    blank_at_end: bool = True
+    simple_punctuation: bool = True
+    punctuation_map: typing.Optional[typing.Mapping[str, str]] = None
+    separate: typing.Optional[typing.Collection[str]] = STRESS
+    separate_graphemes: bool = False
+    separate_tones: bool = False
+    tone_before: bool = False
+
+    def split_word_phonemes(self, phonemes_str: str) -> typing.List[typing.List[str]]:
+        """Split phonemes string into a list of lists (outer is words, inner is individual phonemes in each word)"""
+        return [
+            word_phonemes_str.split(self.phoneme_separator)
+            for word_phonemes_str in phonemes_str.split(self.word_separator)
+        ]
+
 
 @dataclass
 class TrainingConfig(DataClassJsonMixin):
@@ -262,6 +299,7 @@ class TrainingConfig(DataClassJsonMixin):
     best_loss: typing.Optional[float] = None
     audio: AudioConfig = field(default_factory=AudioConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    phonemes: PhonemesConfig = field(default_factory=PhonemesConfig)
     version: int = 1
     git_commit: str = ""
 

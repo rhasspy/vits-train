@@ -1,7 +1,6 @@
 import csv
 import logging
 import math
-import re
 import shutil
 import tempfile
 import typing
@@ -11,6 +10,7 @@ from pathlib import Path
 
 import librosa
 import torch
+from phonemes2ids import phonemes2ids
 from torch.utils.data import Dataset
 
 from vits_train.config import TrainingConfig
@@ -90,6 +90,9 @@ class PhonemeIdsAndMelsDataset(Dataset):
             self.cache_dir = Path(cache_dir)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # Check utterances
+        speakers_with_data: typing.Set[int] = set()
+
         for dataset in datasets:
             for utt_id in dataset.split_ids.get(split, []):
                 audio_path = dataset.audio_dir / utt_id
@@ -100,17 +103,33 @@ class PhonemeIdsAndMelsDataset(Dataset):
 
                 if audio_path.is_file():
                     cache_path = self.cache_dir / dataset.name / utt_id
+                    speaker_id = dataset.utt_speaker_ids.get(utt_id)
+
+                    if config.model.is_multispeaker:
+                        assert speaker_id is not None, f"No speaker for {utt_id}"
+                        speakers_with_data.add(speaker_id)
+
                     self.utterances.append(
                         Utterance(
                             id=utt_id,
                             phoneme_ids=dataset.utt_phoneme_ids[utt_id],
                             audio_path=audio_path,
                             cache_path=cache_path,
-                            speaker_id=dataset.utt_speaker_ids.get(utt_id),
+                            speaker_id=speaker_id,
                         )
                     )
                 else:
                     _LOGGER.warning("Missing audio file: %s", audio_path)
+
+        if config.model.is_multispeaker and (
+            len(speakers_with_data) < config.model.n_speakers
+        ):
+            # Possilbly missing data
+            _LOGGER.warning(
+                "Data was found for only %s/%s speakers",
+                len(speakers_with_data),
+                config.model.n_speakers,
+            )
 
     def __getitem__(self, index):
         utterance = self.utterances[index]
@@ -388,7 +407,6 @@ def load_dataset(
 ) -> DatasetInfo:
     metadata_dir = Path(metadata_dir)
     audio_dir = Path(audio_dir)
-    multispeaker = config.model.n_speakers > 1
 
     # Determine data paths
     data_paths = defaultdict(dict)
@@ -411,29 +429,11 @@ def load_dataset(
             f"Missing {split}_ids.csv or {split}_phonemes.csv in {metadata_dir}"
         )
 
-    # Load phonemes
-    phoneme_to_id = {}
-    phonemes_path = metadata_dir / "phonemes.txt"
-
-    _LOGGER.debug("Loading phonemes from %s", phonemes_path)
-    with open(phonemes_path, "r", encoding="utf-8") as phonemes_file:
-        for line in phonemes_file:
-            line = line.strip("\r\n")
-            if (not line) or line.startswith("#"):
-                continue
-
-            phoneme_id, phoneme = re.split(r"[ \t]", line, maxsplit=1)
-
-            # Avoid overwriting duplicates
-            if phoneme not in phoneme_to_id:
-                phoneme_id = int(phoneme_id)
-                phoneme_to_id[phoneme] = phoneme_id
-
-    id_to_phoneme = {i: p for p, i in phoneme_to_id.items()}
-
     # Load utterances
-    utt_phoneme_ids = {}
-    utt_speaker_ids = {}
+    phoneme_to_id = config.phonemes.phoneme_to_id
+
+    utt_phoneme_ids: typing.Dict[str, str] = {}
+    utt_speaker_ids: typing.Dict[str, int] = {}
 
     for split in splits:
         csv_path = data_paths[split]["csv_path"]
@@ -450,21 +450,46 @@ def load_dataset(
                 assert len(row) > 1, f"{row} in {csv_path}:{row_idx+1}"
                 utt_id, phonemes_or_ids = row[0], row[-1]
 
-                if multispeaker:
+                if config.model.is_multispeaker:
                     if len(row) > 2:
-                        utt_speaker_ids[utt_id] = row[1]
+                        speaker = row[1]
                     else:
-                        utt_speaker_ids[utt_id] = dataset_name
+                        speaker = dataset_name
+
+                    if speaker not in speaker_id_map:
+                        # Add to cross-datatset speaker id map
+                        speaker_id_map[speaker] = len(speaker_id_map)
+
+                    utt_speaker_ids[utt_id] = speaker_id_map[speaker]
 
                 if is_phonemes:
-                    # TODO: Map phonemes with phonemes2ids
-                    raise NotImplementedError(csv_path)
-                    # phoneme_ids = [phoneme_to_id[p] for p in phonemes if p in phoneme_to_id]
-                    # phoneme_ids = intersperse(phoneme_ids, 0)
+                    # Map phonemes with phonemes2ids
+                    assert phoneme_to_id, "No phoneme to id map (missing phonemes.txt?)"
+                    word_phonemes = config.phonemes.split_word_phonemes(phonemes_or_ids)
+                    phoneme_ids = phonemes2ids(
+                        word_phonemes=word_phonemes,
+                        phoneme_to_id=phoneme_to_id,
+                        pad=config.phonemes.pad,
+                        bos=config.phonemes.bos,
+                        eos=config.phonemes.eos,
+                        blank=config.phonemes.blank,
+                        blank_word=config.phonemes.blank_word,
+                        blank_between=config.phonemes.blank_between,
+                        blank_at_start=config.phonemes.blank_at_start,
+                        blank_at_end=config.phonemes.blank_at_end,
+                        simple_punctuation=config.phonemes.simple_punctuation,
+                        punctuation_map=config.phonemes.punctuation_map,
+                        separate=config.phonemes.separate,
+                        separate_graphemes=config.phonemes.separate_graphemes,
+                        separate_tones=config.phonemes.separate_tones,
+                        tone_before=config.phonemes.tone_before,
+                    )
                 else:
                     phoneme_ids = [int(p_id) for p_id in phonemes_or_ids.split()]
                     phoneme_ids = [
-                        p_id for p_id in phoneme_ids if p_id in id_to_phoneme
+                        p_id
+                        for p_id in phoneme_ids
+                        if 0 <= p_id < config.model.num_symbols
                     ]
 
                 if phoneme_ids:

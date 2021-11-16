@@ -48,6 +48,15 @@ def save_checkpoint(checkpoint: Checkpoint, checkpoint_path: Path):
         "version": checkpoint.version,
         "best_loss": checkpoint.best_loss,
     }
+    model_d = checkpoint.model_d
+
+    if model_d is not None:
+        if hasattr(model_d, "module"):
+            state_dict_d = model_d.module.state_dict()  # type: ignore
+        else:
+            state_dict_d = model_d.state_dict()
+
+        checkpoint_dict["model_d"] = state_dict_d
 
     model_d = checkpoint.model_d
 
