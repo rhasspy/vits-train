@@ -213,11 +213,17 @@ def main():
                 audio = audio_float_to_int16(audio)
                 end_time = time.perf_counter()
 
+                audio_duration_sec = audio.shape[-1] / config.audio.sample_rate
+                infer_sec = end_time - start_time
+                real_time_factor = (
+                    infer_sec / audio_duration_sec if audio_duration_sec > 0 else 0.0
+                )
+
                 _LOGGER.debug(
-                    "Generated audio in %s second(s) (%s, shape=%s)",
-                    end_time - start_time,
-                    utt_id,
-                    list(audio.shape),
+                    "Real-time factor: %0.2f (infer=%0.2f sec, audio=%0.2f sec)",
+                    real_time_factor,
+                    infer_sec,
+                    audio_duration_sec,
                 )
 
                 output_file_name = utt_id
